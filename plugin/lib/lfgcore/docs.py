@@ -92,6 +92,9 @@ TEST_FILE = re.compile(r"(^|/)(tests?|__tests__|testdata|spec)/|_test\.(go|py)$|
                        r"\.(test|spec)\.[jt]sx?$|(^|/)tests?\.rs$|Tests?\.(java|kt|cs|swift)$")
 
 
+THIRD_PARTY = re.compile(r"(^|/)(vendor|vendored|third[_-]party|node_modules|external)/", re.I)  # not the team's own
+
+
 def is_test(path):
     return bool(TEST_FILE.search(path or ""))
 
@@ -158,7 +161,10 @@ def wiki_pages(rid):
             dirs = collections.Counter(os.path.dirname(x) for x in srcs if not is_test(x) and not DOC_EXT.search(x))
             if dirs and dirs.most_common(1)[0][0]:
                 top = dirs.most_common(1)[0][0]
-                title = top if is_test(title) or os.path.basename(top) in title else "%s · %s" % (top, title)
+                stem = re.sub(r"\.\w{1,5}$", "", title)
+                title = top if is_test(title) or os.path.basename(top) in title or stem in ("__init__", "index", "mod",
+                                                                                              "main") \
+                    else "%s · %s" % (top, title)
         out.append({"path": name, "title": title, "nodes": int(size.group(1)) if size else 0, "sources": srcs,
                     "lead": re.sub(r"\.\w{1,5}$|\(\)$", "", lead.group(1)) if lead else "",
                     "kind": "doc" if doc else ("code" if size else "node"),
@@ -314,7 +320,8 @@ def _onboarding(rid, root, g, sections, db):
     out = [_header("Onboarding tour", rid, "Read top to bottom: core abstractions, then the areas, then the "
                                              "flows that matter, then the surprises.")]
     out.append("## 1. The codebase at a glance\n\n%s\n\n" % (_glance(g) if g else "_No code map yet._"))
-    guides = [p for p in wiki_pages(rid) if p["kind"] == "doc"][:20]
+    guides = [p for p in wiki_pages(rid)
+              if p["kind"] == "doc" and not all(THIRD_PARTY.search(x) for x in p["sources"])][:20]
     if guides:
         out.append("## Runbooks and guides (from your docs)\n\nWhat the team already wrote down, as graphify read it. "
                    "Start with the runbooks.\n\n")

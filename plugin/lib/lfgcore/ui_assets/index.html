@@ -8,21 +8,24 @@
 <link rel="icon" href="/assets/logo.svg" type="image/svg+xml">
 </head>
 <body>
-<aside class="side">
-  <a class="brand" href="#home"><img src="/assets/logo.svg" alt="" width="22" height="22"><span>LFG</span></a>
-  <div class="pickers">
-    <select id="repo" aria-label="Project"></select>
-    <select id="branch" aria-label="Branch"></select>
+<aside class="side" aria-label="Sidebar">
+  <div class="workspace">
+    <a class="brand" href="#home" aria-label="LFG home"><img src="/assets/logo.svg" alt="" width="20" height="20"></a>
+    <label class="switch" title="Project"><span class="sr">Project</span><select id="repo"></select></label>
   </div>
+  <label class="switch branch" title="Branch"><span class="sr">Branch</span><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3v12M18 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM6 21a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM18 9a9 9 0 0 1-9 9"/></svg><select id="branch"></select></label>
   <nav id="nav" aria-label="Main"></nav>
   <div class="side-foot">
-    <span class="status" id="map-status" title="The code map LFG's agents read instead of whole files"></span>
-    <div>LFG by Varun Singh · runs only on this computer</div>
+    <div class="status" id="map-status" title="The code map LFG's agents read instead of whole files"></div>
+    <div class="credit">LFG · runs only on this computer</div>
   </div>
 </aside>
-<main id="view" class="view" tabindex="-1"><div class="loading">Loading…</div></main>
+<div class="main">
+  <header class="topbar"><nav class="crumbs" id="crumbs" aria-label="Breadcrumb"></nav></header>
+  <main id="view" class="view" tabindex="-1"><div class="loading">Loading…</div></main>
+</div>
 <div class="drawer" id="drawer" hidden>
-  <div class="drawer-panel">
+  <div class="drawer-panel" role="dialog" aria-modal="true" aria-labelledby="drawer-title">
     <div class="drawer-head"><div id="drawer-title"></div><button class="icon-btn" id="drawer-close" aria-label="Close">&times;</button></div>
     <div class="drawer-body" id="drawer-body"></div>
   </div>

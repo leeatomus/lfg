@@ -965,9 +965,50 @@ class RunSummaryTest(unittest.TestCase):
                      "- cause one\n\n## Users\nOn-call.\n")
         self.assertEqual(dash._about(d), ("logs that explain", "Logs say nothing. Nobody can debug."))
         e = tempfile.mkdtemp()
-        self.assertEqual(dash._about(e, {"summary": {"standards": "1 finding", "spec": "ok"}}),
-                         ("", "Review: 1 finding; ok"))
+        self.assertEqual(dash._about(e, {"summary": {"standards": "Two helpers repeat.", "spec": "Undo leaves a key"}}),
+                         ("", "Two helpers repeat. Undo leaves a key."))
         self.assertEqual(dash._about(e, {"summary": "Looks fine."}), ("", "Looks fine."))
+
+    def test_shipcheck_counts_the_checklist_and_what_needs_a_person(self):
+        s = {"pass": True, "part_a": {"applicable": True, "checks": [
+                {"check": "build", "ok": True}, {"check": "image size", "ok": False, "severity": "warn"},
+                {"check": "smoke", "ok": None}]},
+             "checklist": [{"n": 1, "requirement": "Gates green", "status": "pass"},
+                           {"n": 2, "requirement": "Migrations reversible", "status": "n/a"},
+                           {"n": 3, "requirement": "Rollback plan", "status": "manual"},
+                           {"n": 4, "requirement": "Docs", "status": "fail", "detail": "README not updated"}]}
+        items = dash.shipcheck_items(s)
+        self.assertEqual([i["ok"] for i in items], [True, None, None, True, None, None, False])
+        self.assertEqual([i["check"] for i in items if i.get("manual")], ["Rollback plan"])
+        rid = "ship-rid"
+        C.new_run(rid, "x")
+        C.write_json(C.run_file(rid, "07-shipcheck.json"), s)
+        sc = dash.security(rid)["shipcheck"][0]
+        self.assertEqual((sc["ok"], sc["total"], sc["failed"], sc["manual"]), (2, 3, ["Docs"], ["Rollback plan"]))
+
+    def test_review_feedback_only_marks_the_run_it_was_given_on(self):
+        rid = "fb-rid"
+        a = C.new_run(rid, "first")
+        C.write_json(os.path.join(a, "06-review.json"), {"verdict": "approve", "findings": [{"id": "R-1"}]})
+        b = os.path.join(C.runs_dir(rid), "20991231-0000-second")
+        os.makedirs(b)
+        C.write_json(os.path.join(b, "06-review.json"), {"verdict": "changes", "findings": [{"id": "R-1"}]})
+        C.write_json(C.lfg_path("feedback", rid + ".json"), {"R-1": {"verdict": "accept", "run": os.path.basename(a)}})
+        got = {f["run"]: f["feedback"] for f in dash.reviews(rid)["findings"]}
+        self.assertEqual(got, {os.path.basename(a): "accept", "20991231-0000-second": None})
+
+    def test_dev_graph_that_refuses_the_token_says_so(self):
+        dash._CACHE.pop("og-access:dev-graph", None)
+        with mock.patch.object(dash, "_og_ready", return_value=True), \
+                mock.patch.object(dash, "_og", return_value={"error": "HTTP Error 401: Unauthorized"}):
+            why = dash.og_access("dev-graph")
+            self.assertIn("refused LFG's access token", why)
+            self.assertEqual(dash.issues(), {"available": False, "why": why})
+        dash._CACHE.pop("og-access:dev-graph", None)
+
+    def test_vendored_docs_are_not_your_docs(self):
+        self.assertTrue(dash.THIRD_PARTY.search("plugin/vendor/x/README.md"))
+        self.assertFalse(dash.THIRD_PARTY.search("docs/runbooks/vendors.md"))
 
     def test_security_verdict_string_or_object(self):
         self.assertEqual(dash._verdict("safe"), "safe")

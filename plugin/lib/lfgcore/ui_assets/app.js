@@ -84,21 +84,28 @@ const fmtWhy = w => esc(w || "").replace(/`([^`]+)`/g, "<code>$1</code>");
 const STEP = { brief: "Idea written up", design: "Plan", tasks: "Task list", build: "Built", qa: "Tested", gate: "Checks run",
   secure: "Security check", review: "Code review", ship: "Ship check", packet: "Ready to commit" };
 const NEXT = { brief: "write up the idea", design: "make a plan", tasks: "split it into tasks", build: "build it", qa: "test it",
-  gate: "run the checks", secure: "check security", review: "review the code", ship: "run the ship check", packet: "prepare the commit message" };
-function runPlace(stages, done) {
-  /* where the run is = the furthest step done (review-only runs skip the early steps) */
+  gate: "run the checks", secure: "check security", review: "review the code", ship: "run the ship check", packet: "prepare the commit message",
+  "fix-checks": "fix the failing checks (/lfg:fix)", "fix-block": "decide what to do about the blocked review",
+  "fix-review": "address the review's requested changes", "fix-security": "fix the security problems (/lfg:fix)",
+  "fix-ship": "fix what the ship check found" };
+function runPlace(stages, done, r) {
+  /* done = steps that really happened; next = what blocks first (a failing check, a review asking for changes),
+     else the step after the furthest one done (review-only runs skip the early steps, so those don't count as next) */
   const keys = stages.map(s => s[0]), last = keys.reduce((a, x, i) => (done[x] ? i : a), -1);
-  const next = keys.slice(last + 1)[0];
-  return { done: last + 1, total: keys.length, next, finished: !next };
+  const count = keys.filter(k => done[k]).length;
+  const block = r && (r.ready === "red" ? "fix-checks" : r.review === "block" ? "fix-block" : r.secure === "don't" ? "fix-security"
+    : r.review === "changes" ? "fix-review" : r.shipcheck === "fail" ? "fix-ship" : null);  // most serious first
+  const next = block || keys.slice(last + 1)[0];
+  return { done: count, total: keys.length, next, blocked: !!block, finished: !next };
 }
-const runName = r => r.title || words(r.slug || "untitled run");
+const runName = r => r.title || (w => w.charAt(0).toUpperCase() + w.slice(1))(words(r.slug || "untitled run"));
 
 // ------------------------------------------------------------------ components
 function empty(title, body) {
   return `<div class="empty"><h3>${esc(title)}</h3><div>${body || ""}</div></div>`;
 }
 function unavailable(d, title) {
-  return `<div class="box">${empty(title || "Not available yet", fmtWhy(d && d.why))}</div>`;
+  return `<div class="callout warn"><b>${esc(title || "Not available yet")}</b><div class="small" style="margin-top:2px">${fmtWhy(d && d.why)}</div></div>`;
 }
 function head(title, text, back) {
   return `<div class="head">${back || ""}<h1>${esc(title)}</h1>${text ? `<p>${text}</p>` : ""}</div>`;
@@ -160,7 +167,7 @@ function mountTabs(root = document) {
   $$("[data-tabs]", root).forEach(bar => {
     const id = bar.dataset.tabs;
     const show = k => {
-      $$(".tab", bar).forEach(b => b.classList.toggle("on", b.dataset.k === k));
+      $$(".tab", bar).forEach(b => { b.classList.toggle("on", b.dataset.k === k); if (b.dataset.k === k && bar.scrollWidth > bar.clientWidth) bar.scrollLeft = b.offsetLeft - 16; });
       const it = TABS[id].find(x => x[0] === k);
       const body = document.getElementById(id + "-body");
       body.innerHTML = it[3]();
@@ -226,7 +233,7 @@ function md(text, link) {
       const cells = r => r.trim().replace(/^\||\|$/g, "").split(/(?<!\\)\|/).map(c => c.trim().replace(/\\\|/g, "|"));
       const hd = cells(l); i += 2; const body = [];
       while (i < L.length && /^\s*\|/.test(L[i])) body.push(cells(L[i++]));
-      out += `<table><thead><tr>${hd.map(h => `<th>${inline(h, link)}</th>`).join("")}</tr></thead><tbody>${body.map(r => `<tr>${r.map(c => `<td>${inline(c, link)}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
+      out += `<div class="md-table"><table><thead><tr>${hd.map(h => `<th>${inline(h, link)}</th>`).join("")}</tr></thead><tbody>${body.map(r => `<tr>${r.map(c => `<td>${inline(c, link)}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`;
       continue;
     }
     let m;
@@ -322,13 +329,19 @@ function taskItem(t) {
   return `<details class="item"><summary>${dot(t.passes ? "ok" : "")}<span class="grow">${txt(t.description || t.id || "Task")}</span><span class="muted small nowrap">${t.passes ? "done" : "to do"}</span></summary><div class="item-body">${body}</div></details>`;
 }
 /* A check that ran (tests, lint, ship check): failed ones open to show the error */
+const CHECK_NAMES = { lint: "Lint", types: "Type check", test: "Tests", build: "Build", secrets: "Secret scan",
+  suppressions: "No new lint or test suppressions" };
 function checkItem(name, result, out, cmd) {
-  const [word, tone] = { pass: ["passed", "ok"], fail: ["failed", "bad"], skip: ["not run", ""] }[result];
-  const body = result !== "pass" && out ? `${cmd ? `<div class="muted small mono">${esc(cmd)}</div>` : ""}<pre class="out">${esc(out)}</pre>` : "";
-  return `<details class="item${body ? "" : " plain"}"><summary>${dot(tone)}<span class="grow">${esc(words(name))}</span><span class="muted small nowrap">${word}</span></summary>${body ? `<div class="item-body">${body}</div>` : ""}</details>`;
+  const [word, tone] = { pass: ["passed", "ok"], fail: ["failed", "bad"], skip: ["not run", ""], na: ["doesn't apply", ""], manual: ["for you to do", "warn"] }[result];
+  const body = !["pass", "skip", "na"].includes(result) && out ? `${cmd ? `<div class="muted small mono">${esc(cmd)}</div>` : ""}<pre class="out">${esc(out)}</pre>` : "";
+  return `<details class="item${body ? "" : " plain"}"><summary>${dot(tone)}<span class="grow">${esc(CHECK_NAMES[name] || (/\s/.test(name || "") ? name : (w => w.charAt(0).toUpperCase() + w.slice(1))(words(name || ""))))}</span><span class="muted small nowrap">${word}</span></summary>${body ? `<div class="item-body">${body}</div>` : ""}</details>`;
 }
 const readyChecks = cs => (cs || []).map(c => checkItem(c.name, c.exit === 0 ? "pass" : c.exit == null ? "skip" : "fail", c.tail, c.cmd)).join("");
-const shipChecks = cs => (cs || []).map(c => checkItem(c.check || c.name, c.ok ? "pass" : c.ok == null ? "skip" : "fail", c.detail)).join("");
+const shipChecks = cs => (cs || []).map(c => checkItem(c.check || c.name, c.manual ? "manual" : c.status === "n/a" ? "na" : c.ok ? "pass" : c.ok == null ? "skip" : "fail", c.detail)).join("");
+/* 07-shipcheck.json: part A (container) checks + the shipping checklist, as one list (same as dash.shipcheck_items) */
+const shipItems = d => [].concat(((d.part_a || {}).checks || []).map(c => ({ check: c.check, ok: c.severity === "warn" && c.ok === false ? null : c.ok, detail: c.detail })),
+  (d.checklist || (d.part_b || {}).checks || []).map(i => ({ check: i.requirement || i.check, detail: i.detail, manual: i.status === "manual", status: i.status,
+    ok: "ok" in i ? i.ok : i.status === "pass" ? true : i.status === "fail" ? false : null })));
 const verdictOf = v => (v && typeof v === "object" ? v.overall : v);
 const JSON_VIEWS = {
   "06-review.json": d => `<p>${st(d.verdict)}</p>${typeof d.summary === "string" ? `<p>${txt(d.summary)}</p>` : d.summary ? readable(d.summary) : ""}
@@ -341,7 +354,7 @@ const JSON_VIEWS = {
     ${(d.findings || []).length ? `<h3>Findings</h3>${findingList(d.findings)}` : ""}${moreDetails(d, ["status", "summary", "conclusion", "preflight_failures", "next_steps", "findings", "ts", "ran"])}`,
   "tasks.json": d => { const l = Array.isArray(d) ? d : d.tasks || []; return l.length ? l.map(taskItem).join("") : '<p class="muted">No tasks.</p>'; },
   "ready.json": d => `<p>${st(d.green ? "green" : "red")}</p>${readyChecks(d.checks)}`,
-  "07-shipcheck.json": d => `<p>${st(d.pass ? "pass" : "fail")}</p>${shipChecks([].concat((d.part_a || {}).checks || [], (d.part_b || {}).checks || []))}${moreDetails(d, ["pass", "part_a", "part_b", "ts", "run"])}`,
+  "07-shipcheck.json": d => `<p>${st(d.pass ? "pass" : "fail")}</p>${(d.part_a || {}).note ? `<p class="muted">${txt(d.part_a.note)}</p>` : ""}${shipChecks(shipItems(d))}${moreDetails(d, ["pass", "part_a", "part_b", "checklist", "ts", "run", "run_id"])}`,
 };
 /* Skill and rule files start with a YAML header; show its description, not the YAML */
 function frontMatter(text) {
@@ -652,7 +665,7 @@ async function loadOllama() {
   const canPull = un && d.running ? "" : "disabled";
   const pulls = Object.entries(d.pulls || {});
   const use = name => (name === d.current ? `<span class="st">${dot("ok")}In use</span>` : `<button class="btn" data-ollama-use="${esc(name)}" ${dis}>Use</button>`);
-  box.innerHTML = `<p class="muted">Security tests (<code>/pentest</code>) run on a model on this computer, never in the cloud. ${d.running ? "" : fmtWhy(d.why)}</p>
+  box.innerHTML = `<p class="muted">Security tests (<code>/lfg:pentest</code>) run on a model on this computer, never in the cloud. ${d.running ? "" : fmtWhy(d.why)}</p>
     <div class="row">${dot(d.running ? "ok" : "bad")}<span>${d.running ? "Ollama is running" : "Ollama is not running"}</span><span class="muted small">· model in use: ${d.current ? esc(d.current) : "none yet"}${d.ram_gb ? ` · this computer has ${d.ram_gb} GB memory` : ""}</span></div>
     ${pulls.length ? `<div class="set-section"><h4>Downloading</h4>${pulls.map(([k, p]) => pullBar(k, p)).join("")}</div>` : ""}
     <div class="set-section"><h4>On this computer</h4><div class="box">${table(d.installed, [
@@ -801,8 +814,8 @@ async function cachedRuns() {
 
 /* What a run is doing, in one line: "Step 5 of 10 · next: run the checks" */
 function runLine(r, stages) {
-  const p = runPlace(stages, r.stages);
-  return p.finished ? "All steps done" : `Step ${p.done} of ${p.total} · next: ${NEXT[p.next]}`;
+  const p = runPlace(stages, r.stages, r);
+  return p.finished ? "All steps done" : `${p.done} of ${p.total} steps · next: ${NEXT[p.next]}`;
 }
 /* Things on a run that need a person, as [tone, text] */
 function runAttention(r) {
@@ -812,7 +825,8 @@ function runAttention(r) {
   if (r.secure === "don't") out.push(["bad", "The security check found problems to fix"]);
   if (r.ready === "red") out.push(["bad", "Tests or checks are failing"]);
   if (r.shipcheck === "fail") out.push(["bad", "The ship check failed"]);
-  return out;
+  if (r.pentest === "refused") out.push(["warn", "The security test didn't run: open the Security test document to see why"]);
+  return out.sort((a, b) => (a[0] === "bad" ? 0 : 1) - (b[0] === "bad" ? 0 : 1));
 }
 
 PAGES.home = async () => {
@@ -825,33 +839,35 @@ PAGES.home = async () => {
   if (run) runAttention(run).forEach(([tn, text]) => attn.push([tn, text, `#runs/${encodeURIComponent(run.run)}`]));
   if (d.security && d.security.blocking && !(run && run.secure === "don't")) attn.push(["bad", `The latest security check found ${plural(d.security.blocking, "problem")}`, "#checks"]);
   if (g.status === "error") attn.push(["bad", "The code map failed to update", "#code"]);
-  (d.integrations || []).filter(x => !x.ok && !x.optional).forEach(x => attn.push(["warn", `${x.name} is not running`, "#settings"]));
+  (d.integrations || []).filter(x => !x.ok && !x.optional).forEach(x => attn.push(["warn", x.problem || `${x.name} needs attention`, "#settings"]));
   if (d.work && d.work.blocked) attn.push(["warn", `${plural(d.work.blocked, "issue")} blocked by other work`, "#issues"]);
+  const worst = attn.some(a => a[0] === "bad") ? "bad" : attn.length ? "warn" : "ok";
   const attnBox = attn.length
-    ? `<div class="box"><ul class="list attn">${attn.map(([tn, text, href]) => `<li>${dot(tn)}<a class="grow" href="${href}">${esc(text)}</a></li>`).join("")}</ul></div>`
-    : `<div class="box calm">${dot("ok")}Nothing needs you right now.</div>`;
+    ? `<div class="callout ${worst}"><ul class="attn">${attn.map(([tn, text, href]) => `<li>${dot(tn)}<a class="grow" href="${href}">${fmtWhy(text)}</a><span class="go" aria-hidden="true">→</span></li>`).join("")}</ul></div>`
+    : `<div class="callout ok">${dot("ok")}Nothing needs you right now.</div>`;
   // the current run
   let now;
   if (run) {
-    const p = runPlace(stages, run.stages);
-    now = `<a class="box pad now" href="#runs/${encodeURIComponent(run.run)}" style="display:block;color:inherit;text-decoration:none">
+    const p = runPlace(stages, run.stages, run);
+    now = `<a class="now" href="#runs/${encodeURIComponent(run.run)}">
       <h2>${esc(runName(run))}</h2>
       ${run.about ? `<p class="about">${txt(run.about)}</p>` : ""}
       <div class="meta">${run.branch ? `On branch ${esc(run.branch)} · ` : ""}started ${ago(run.created)}${run.tasks.total ? ` · ${run.tasks.done} of ${plural(run.tasks.total, "task")} done` : ""}</div>
-      <div class="progress"><span style="width:${pct(p.done, p.total)}%"></span></div>
-      <div class="small">${p.finished ? "All steps done. The commit message is ready for you." : `Next: ${esc(NEXT[p.next])}`}</div></a>`;
+      <div class="progress${p.blocked ? " stuck" : p.finished ? " done" : ""}"><span style="width:${pct(p.done, p.total)}%"></span></div>
+      <div class="next${p.blocked ? " stuck" : ""}">${p.finished ? "All steps done. The commit message is ready for you." : `${p.done} of ${p.total} steps · next: ${esc(NEXT[p.next])}`}</div></a>`;
   } else {
-    now = `<div class="box">${empty("Nothing in progress", "Start in Claude Code with <code>/lfg</code> and a short description of what you want, or <code>/wizard</code> for a guided run.")}</div>`;
+    now = `<div class="box">${empty("Nothing in progress", "Start in Claude Code with <code>/lfg:lfg</code> and a short description of what you want, or <code>/lfg:wizard</code> for a guided run.")}</div>`;
   }
   const recent = all.runs.filter(r => !run || r.run !== run.run).slice(0, 5);
   const recentBox = recent.length ? `<div class="box"><ul class="list">${recent.map(r => `<li class="click" data-href="#runs/${encodeURIComponent(r.run)}"><div class="grow"><div class="title">${esc(runName(r))}</div>${r.about ? `<div class="about clamp">${txt(r.about)}</div>` : ""}<div class="meta">${esc(runLine(r, stages))}</div></div><span class="muted small nowrap">${ago(r.created)}</span></li>`).join("")}</ul></div>` : "";
-  const used = (t.input || 0) + (t.output || 0);
+  const used = (t.input || 0) + (t.output || 0) + (t.cache_read || 0) + (t.cache_write || 0);
+  const cached = pct(t.cache_read || 0, used - (t.output || 0));
   const saved = hr.available && hr.lifetime && hr.lifetime.tokens_saved;
-  return `${head(run ? "Here's what's happening" : "All quiet", `In <b>${esc(repoName())}</b>${state.branch ? ` on ${esc(state.branch === "-" ? "unrecorded branches" : state.branch)}` : ""}.`)}
+  return `${head(repoName() || "Home", `${run ? "What LFG is doing in this project" : "Nothing in progress in this project"}${state.branch ? `, on ${esc(state.branch === "-" ? "unrecorded branches" : state.branch)}` : ""}.`)}
     ${section(run ? "Working on" : "Current work", now)}
     ${section("Needs your attention", attnBox)}
     ${recent.length ? section("Earlier runs", recentBox, `<a href="#runs">See all ${n(all.runs.length)}</a>`) : ""}
-    ${section("This week", `<div class="cols">${(d.spend || {}).available ? stat("AI cost", usd(d.spend["7d"]), `${compact(used)} tokens, all projects${saved ? ` · ${compact(saved)} saved by compression` : ""}`) : stat("AI tokens used", compact(used), `across all projects${saved ? ` · ${compact(saved)} saved by compression so far` : ""}`)}${stat("Code map", say(g.status)[0] || "Unknown", `${g.status === "missing" ? "not built yet" : g.synced_at ? `updated ${ago(g.synced_at)}` : ""} ${mapBtn(g.status)}`)}${d.work ? stat("Issues ready to start", n(d.work.ready), d.work.blocked ? `${n(d.work.blocked)} blocked` : "none blocked") : ""}</div>`)}`;
+    ${section("This week", `<div class="cols">${(d.spend || {}).available ? stat("AI cost", usd(d.spend["7d"]), `${compact(used)} tokens, all projects${saved ? ` · ${compact(saved)} saved by compression` : ""}`) : stat("AI tokens", compact(used), `all projects, last 7 days · ${cached}% from cache${saved ? ` · ${compact(saved)} saved by compression` : ""}`)}${stat("Code map", say(g.status)[0] || "Unknown", `${g.status === "missing" ? "not built yet" : g.synced_at ? `updated ${ago(g.synced_at)}` : ""} ${mapBtn(g.status)}`)}${d.work && !d.work.why ? stat("Issues ready to start", n(d.work.ready), d.work.blocked ? `${n(d.work.blocked)} blocked` : "none blocked") : d.work ? stat("Issues", "Not available", fmtWhy(d.work.why)) : ""}</div>`)}`;
 };
 
 PAGES.runs = async arg => {
@@ -864,35 +880,42 @@ PAGES.runs = async arg => {
       { k: "progress", label: "Where it is", html: r => esc(runLine(r, d.stages)), sort: r => r.progress },
       { k: "attn", label: "Status", html: r => { const a = runAttention(r); return a.length ? `<span class="st">${dot(a[0][0])}${esc(a[0][1])}</span>` : `<span class="st">${dot("ok")}On track</span>`; }, sort: r => runAttention(r).length },
       { k: "created", label: "Started", html: r => `<span class="nowrap">${ago(r.created)}</span>` },
-    ], { onRow: r => (location.hash = "#runs/" + encodeURIComponent(r.run)), emptyTitle: "No runs yet", emptyBody: "Start one in Claude Code with <code>/lfg</code> and what you want built." })}</div>`;
+    ], { onRow: r => (location.hash = "#runs/" + encodeURIComponent(r.run)), emptyTitle: "No runs yet", emptyBody: "Start one in Claude Code with <code>/lfg:lfg</code> and what you want built." })}</div>`;
 };
 
 const FILE_NAMES = { "01-brief.md": "The idea, written up", "02-design.md": "The plan", "tasks.json": "Task list", "04-qa.md": "Test report",
   "ready.json": "Check results", "05-secure.json": "Security check", "05-pentest.json": "Security test", "06-review.json": "Code review",
   "07-shipcheck.json": "Ship check", "COMMIT_MSG.md": "Commit message", "PR_BODY.md": "Pull request text", "progress.md": "Progress notes" };
-const fileName = f => FILE_NAMES[f] || (/^03-build-(.+)\.md$/.test(f) ? `Build notes · ${words(f.slice(9, -3))}` : null);
+const fileName = f => FILE_NAMES[f] || (/^03-build-(.+)\.md$/.test(f) ? `Build notes · ${f.slice(9, -3)}` : null);
+/* documents in pipeline order: brief, plan, tasks, build notes, tests, checks, security, review, ship, packet, notes */
+const FILE_ORDER = ["01-brief.md", "02-design.md", "tasks.json", "03-build-", "04-qa.md", "ready.json", "05-secure.json", "05-pentest.json",
+  "06-review.json", "07-shipcheck.json", "COMMIT_MSG.md", "PR_BODY.md", "progress.md"];
+const fileRank = f => { const i = FILE_ORDER.findIndex(x => f === x || (x.endsWith("-") && f.startsWith(x))); return i < 0 ? 99 : i; };
 
 async function runDetail(run) {
   const [d, all] = await Promise.all([api("run", { run }), cachedRuns()]);
   if (d.available === false) return unavailable(d);
-  const p = runPlace(all.stages, d.stages), attn = runAttention(d);
-  const steps = `<div class="steps">${all.stages.map(([k]) => `<span class="${d.stages[k] ? "done" : k === p.next ? "next" : ""}">${esc(STEP[k] || k)}</span>`).join("")}</div>`;
-  const files = d.files.filter(f => fileName(f.name)).map(f => ({ ...f, run, label: fileName(f.name) }));
+  const p = runPlace(all.stages, d.stages, d), attn = runAttention(d);
+  const stuck = { "fix-checks": "gate", "fix-review": "review", "fix-block": "review", "fix-security": "secure", "fix-ship": "ship" }[p.next];
+  const steps = `<div class="steps">${all.stages.map(([k]) => `<span class="${k === stuck ? "stuck" : d.stages[k] ? "done" : k === p.next ? "next" : ""}">${esc(STEP[k] || k)}</span>`).join("")}</div>`;
+  const files = d.files.filter(f => fileName(f.name)).map(f => ({ ...f, run, label: fileName(f.name) }))
+    .sort((a, b) => fileRank(a.name) - fileRank(b.name) || a.name.localeCompare(b.name));
   const tasks = d.tasks_list.length ? `<div class="box items">${d.tasks_list.map(taskItem).join("")}</div>` : "";
   const checks = d.checks.length ? `<div class="box items">${readyChecks(d.checks)}</div>` : "";
+  crumbs("runs", runName(d));
   return `${head(runName(d), `${d.branch ? `On branch ${esc(d.branch)} · ` : ""}started ${ago(d.created)}`, '<a class="back" href="#runs">← All runs</a>')}
     ${d.about ? `<p class="about lead">${txt(d.about)}</p>` : ""}
-    <div class="box pad"><div class="row"><b>${p.finished ? "All steps done" : `Step ${p.done} of ${p.total}`}</b><span class="muted">${p.finished ? "· the commit message is ready for you to review" : `· next: ${esc(NEXT[p.next])}`}</span></div>
-      <div class="progress"><span style="width:${pct(p.done, p.total)}%"></span></div>${steps}</div>
-    ${attn.length ? section("Needs your attention", `<div class="box"><ul class="list">${attn.map(([tn, text]) => `<li>${dot(tn)}<span>${esc(text)}</span></li>`).join("")}</ul></div>`) : ""}
+    <div class="panel"><div class="row"><b>${p.finished ? "All steps done" : `${p.done} of ${p.total} steps done`}</b><span class="muted${p.blocked ? " stuck-text" : ""}">${p.finished ? "· the commit message is ready for you to review" : `· next: ${esc(NEXT[p.next])}`}</span></div>
+      <div class="progress${p.blocked ? " stuck" : p.finished ? " done" : ""}"><span style="width:${pct(p.done, p.total)}%"></span></div>${steps}</div>
+    ${attn.length ? section("Needs your attention", `<div class="callout ${attn.some(a => a[0] === "bad") ? "bad" : "warn"}"><ul class="attn">${attn.map(([tn, text]) => `<li>${dot(tn)}<span class="grow">${esc(text)}</span></li>`).join("")}</ul></div>`) : ""}
     ${tasks ? section("Tasks", tasks, `${d.tasks.done} of ${d.tasks.total} done · click one for its steps`) : ""}
     ${checks ? section("Checks", checks, "click a failed one to see why") : ""}
-    ${files.length ? section("Documents", `<div class="box"><ul class="list">${files.map(f => `<li><a href="#" class="grow" data-run-file='${esc(JSON.stringify([f.run, f.name]))}'>${esc(f.label)}</a><span class="muted small nowrap">${esc(f.mtime)}</span></li>`).join("")}</ul></div>`) : ""}`;
+    ${files.length ? section("Documents", `<div class="box"><ul class="list">${files.map(f => `<li><a href="#" class="grow" data-run-file='${esc(JSON.stringify([f.run, f.name]))}'>${esc(f.label)}</a><span class="muted small nowrap" title="${esc(f.mtime)}">${ago(f.mtime.replace(" ", "T"))}</span></li>`).join("")}</ul></div>`) : ""}`;
 }
 
 PAGES.issues = async () => {
   const d = await api("issues");
-  if (d.available === false) return unavailable(d, "Issues aren't available");
+  if (d.available === false) return `${head("Issues", "Your Linear issues, copied into dev-graph by <code>/lfg:inbox</code>.")}${unavailable(d, "Issues aren't available")}`;
   const ws = d.linear_workspace;
   const key = r => [r.legacyRef, r.slug].find(v => /^[A-Z][A-Z0-9]+-\d+$/.test(v || ""));
   const title = r => {
@@ -909,12 +932,12 @@ PAGES.issues = async () => {
     ${r.acceptanceCriteria ? `<h3>Done when</h3><div class="md">${md(r.acceptanceCriteria)}</div>` : ""}</div>`);
   cols[0].html = r => `${title(r)}${r.description ? `<div class="sub clamp">${esc(r.description)}</div>` : ""}`;
   const plain = rows => table(fill(rows), cols, { onRow: open });
-  return `${head("Issues", `Your Linear issues, copied in by <code>/inbox</code>. ${n(d.ready.length)} ready to start, ${n(d.blocked.length)} waiting on other work.`)}
-    ${d.error ? `<div class="notice">Couldn't read the issues: ${esc(d.error)}</div>` : ""}
+  return `${head("Issues", `Your Linear issues, copied in by <code>/lfg:inbox</code>. ${n(d.ready.length)} ready to start, ${n(d.blocked.length)} waiting on other work.`)}
+    ${d.error ? `<div class="callout bad">Couldn't read the issues: ${esc(d.error)}</div>` : ""}
     ${tabs("issues", [
       ["ready", "Ready to start", d.ready.length, () => `<div class="box">${plain(d.ready)}</div>`],
       ["blocked", "Waiting on other work", d.blocked.length, () => `<div class="box">${plain(d.blocked)}</div>`],
-      ["all", "All", d.issues.length, () => `<div class="box">${table(d.issues, cols, { onRow: open, emptyTitle: "No issues yet", emptyBody: "Run <code>/inbox</code> in Claude Code to bring in your Linear issues." })}</div>`],
+      ["all", "All", d.issues.length, () => `<div class="box">${table(d.issues, cols, { onRow: open, emptyTitle: "No issues yet", emptyBody: "Run <code>/lfg:inbox</code> in Claude Code to bring in your Linear issues." })}</div>`],
     ])}`;
 };
 
@@ -922,15 +945,15 @@ PAGES.checks = async () => {
   const [r, s] = await Promise.all([api("reviews"), api("security")]);
   const last = s.secure[0], ship = s.shipcheck[0], rev = r.verdicts[0];
   const open = r.findings.filter(f => !f.feedback);
-  const sum = `<div class="cols">${stat("Latest code review", rev ? say(rev.verdict)[0] : "None yet", rev ? plural(rev.findings, "finding") : "run <code>/expert</code>")}${stat("Latest security check", last ? say(last.verdict)[0] : "None yet", last ? (last.blocking ? `${plural(last.blocking, "problem")} to fix` : "nothing blocking") : "run <code>/secure</code>")}${stat("Latest ship check", ship ? (ship.pass ? "Passed" : "Failed") : "None yet", ship ? `${ship.ok} of ${ship.total} checks passed` : "")}</div>`;
+  const sum = `<div class="cols">${stat("Latest code review", rev ? say(rev.verdict)[0] : "None yet", rev ? plural(rev.findings, "finding") : "run <code>/lfg:expert</code>")}${stat("Latest security check", last ? say(last.verdict)[0] : "None yet", last ? (last.blocking ? `${plural(last.blocking, "problem")} to fix` : "nothing blocking") : "run <code>/lfg:secure</code>")}${stat("Latest ship check", ship ? (ship.pass ? "Passed" : "Failed") : "None yet", ship ? `${ship.ok} of ${ship.total} checks passed${(ship.manual || []).length ? ` · ${ship.manual.length} for you to do` : ""}` : "run <code>/lfg:ship</code>")}</div>`;
   const sevSort = { blocker: 0, critical: 0, high: 1, major: 1, medium: 2, minor: 3, low: 3, nit: 4 };
   return `${head("Checks", "What the code reviews and security checks found, and the actions LFG stopped to keep your work safe.")}
     ${sum}
     <div class="section">${tabs("checks", [
       ["review", "Review findings", r.findings.length, () => `<div class="box">${table(r.findings, [
         { k: "severity", label: "How serious", html: x => st(x.severity), sort: x => -(sevSort[String(x.severity).toLowerCase()] ?? 5) },
-        { k: "message", label: "Finding", html: x => `${txt(x.title || x.finding || x.message || x.id)}${x.fix ? `<div class="sub clamp">What to do: ${txt(x.fix)}</div>` : ""}${x.file ? `<div class="sub mono">${esc(x.file)}${x.line ? ":" + esc(x.line) : ""}</div>` : ""}` },
-        { k: "feedback", label: "Your call", html: x => st(x.feedback, "not decided") }], { onRow: x => openDrawer("Review finding", `<div class="readable">${findingCard(x)}</div>`), emptyTitle: "No findings", emptyBody: "Run <code>/expert</code> on a change." })}</div>${open.length ? `<p class="muted small">Record your call with <code>lfg feedback add &lt;id&gt; accept|reject</code>.</p>` : ""}`],
+        { k: "message", label: "Finding", html: x => `${txt(x.title || x.finding || x.message || x.id)}${x.fix ? `<div class="sub clamp">What to do: ${txt(x.fix)}</div>` : ""}${x.file ? `<div class="sub mono">${esc(x.file)}${x.line ? ":" + esc(x.line) : ""}</div>` : ""}<div class="sub">from <a href="#runs/${encodeURIComponent(x.run)}">${esc(runName({ slug: String(x.run || "").slice(14) }))}</a></div>` },
+        { k: "feedback", label: "Your call", html: x => st(x.feedback, "not decided") }], { onRow: x => openDrawer("Review finding", `<div class="readable">${findingCard(x)}</div>`), emptyTitle: "No findings", emptyBody: "Run <code>/lfg:expert</code> on a change." })}</div>${open.length ? `<p class="muted small">Record your call with <code>lfg feedback add &lt;id&gt; accept|reject</code>.</p>` : ""}`],
       ["security", "Security checks", s.secure.length, () => `<div class="box">${table(s.secure, [
         { k: "verdict", label: "Result", html: x => st(x.verdict) },
         { k: "blocking", label: "Problems to fix", num: true },
@@ -939,8 +962,8 @@ PAGES.checks = async () => {
         { onRow: x => openDrawer("Security check", `<div class="readable"><p>${st(x.verdict)}</p>${x.scope ? `<p class="muted">Checked: ${txt(x.scope)}</p>` : ""}${findingList(x.findings, "No security problems found.")}</div>`) })}</div>`],
       ["pentest", "Security tests", s.pentest.length, () => `<div class="box">${table(s.pentest, [{ k: "status", label: "Result", html: x => st(x.status) }, { k: "summary", label: "What happened", html: x => `<div class="clamp">${txt(x.summary)}</div>` }, { k: "model", label: "Local model" }],
         { onRow: x => openDrawer("Security test", `<div class="readable">${JSON_VIEWS["05-pentest.json"](x)}</div>`) })}</div>`],
-      ["ship", "Ship checks", s.shipcheck.length, () => `<div class="box">${table(s.shipcheck, [{ k: "pass", label: "Result", html: x => st(x.pass ? "pass" : "fail") }, { k: "ok", label: "Passed", html: x => `${x.ok} of ${x.total}` }, { k: "failed", label: "What failed", html: x => esc((x.failed || []).map(words).join(", ") || "—") }],
-        { onRow: x => openDrawer("Ship check", `<div class="readable"><p>${st(x.pass ? "pass" : "fail")}</p>${(x.failures || []).length ? shipChecks(x.failures.map(c => ({ ...c, ok: false }))) : '<p class="muted">Every check passed.</p>'}</div>`) })}</div>`],
+      ["ship", "Ship checks", s.shipcheck.length, () => `<div class="box">${table(s.shipcheck, [{ k: "pass", label: "Result", html: x => st(x.pass ? "pass" : "fail") }, { k: "ok", label: "Passed", html: x => `${x.ok} of ${x.total}` }, { k: "failed", label: "What failed", html: x => esc((x.failed || []).join(", ") || "—") }, { k: "ts", label: "When", html: x => `<span class="nowrap">${ago(x.ts)}</span>` }],
+        { onRow: x => openDrawer("Ship check", `<div class="readable"><p>${st(x.pass ? "pass" : "fail")}</p>${x.note ? `<p class="muted">${txt(x.note)}</p>` : ""}<div class="items">${shipChecks(x.checks)}</div></div>`) })}</div>`],
       ["stopped", "Stopped actions", r.blocked.length, () => `<p class="muted">Actions an agent tried that break a rule, so LFG stopped them. Nothing here needs you; it shows the guard working.</p><div class="box">${table(r.blocked, [{ k: "why", label: "What was stopped", html: x => esc(x.why || x.tool) }, { k: "rule", label: "Rule", html: x => `rule ${esc(x.rule)}` }, { k: "ts", label: "When", html: x => `<span class="nowrap">${ago(x.ts)}</span>` }])}</div>`],
     ])}</div>`;
 };
@@ -956,7 +979,7 @@ PAGES.code = async () => {
   let summary = "";
   if (c.available !== false) {
     const cov = pct(c.coverage.tested, c.coverage.tested + c.coverage.untested);
-    summary = `${n(c.nodes.File)} files and ${n((c.nodes.Function || 0) + (c.nodes.Class || 0))} functions and classes. ${cov}% of them have a test.`;
+    summary = `${n(c.nodes.File)} code files, ${n((c.nodes.Function || 0) + (c.nodes.Class || 0))} functions and classes; code-review-graph links ${cov}% of them to a test.`;
   }
   const risky = c.available !== false ? (c.hotspots || []).slice(0, 10) : [];
   const areas = a.available !== false ? a.community_list.slice(0, 12) : [];
@@ -968,7 +991,7 @@ PAGES.code = async () => {
       { k: "callers", label: "Used by", num: true, html: r => plural(r.callers, "place") },
       { k: "coverage", label: "Tested", html: r => (r.coverage === "tested" ? `${dot("ok")} Yes` : `${dot("warn")} No`) }], { filter: false })}</div>`, "used in many places, so a change here reaches far") : ""}
     ${areas.length ? section("Main parts of the code", `<div class="box"><ul class="list">${areas.map(x => `<li><div class="grow"><div class="title">${esc(x.name)}</div><div class="meta">${esc((x.files || []).slice(0, 3).join(" · "))}</div></div></li>`).join("")}</ul></div>`) : ""}
-    ${notes.length ? section("Notes left in the code", `<div class="box">${table(notes, [{ k: "note", label: "Note" }, { k: "file", label: "Where", html: r => `<span class="small muted">${esc(r.file + (r.line ? ":" + r.line : ""))}</span>` }])}</div>`, "WHY, NOTE and HACK comments") : ""}
+    ${notes.length ? section("Why the code is the way it is", `<div class="box">${table(notes, [{ k: "note", label: "Explanation" }, { k: "file", label: "Where", html: r => `<span class="small muted mono nowrap">${esc(r.file + (r.line ? ":" + r.line : ""))}</span>` }])}</div>`, `docstrings and WHY / NOTE / HACK comments${a.rationale_total > notes.length ? `, first ${notes.length} of ${n(a.rationale_total)}` : ""}`) : ""}
     ${section("Explore", `<div class="row"><button class="btn" data-view="architecture" data-target="explore">Map of the code</button><button class="btn" data-view="callflow" data-target="explore">How calls flow</button><button class="btn" data-view="code" data-target="explore">Detailed code graph</button><button class="btn" data-view="health" data-target="explore">Health report</button></div><div id="explore"></div>`)}`;
 };
 
@@ -994,14 +1017,16 @@ PAGES.docs = async arg => {
 
 PAGES.knowledge = async () => {
   const [k, b] = await Promise.all([api("knowledge"), api("brain")]);
-  if (k.available === false && b.available === false) return unavailable(k, "Knowledge isn't available");
+  if (k.available === false && b.available === false) return `${head("Knowledge", "What LFG remembers between sessions: decisions and lessons about this project, and your own preferences.")}${unavailable(k, "Knowledge isn't available")}${b.why && b.why !== k.why ? unavailable(b, "Your second-brain isn't available") : ""}`;
   const K = k.available === false ? { decisions: [], principles: [], invariants: [], unheld: [], gaps: [], learnings: [] } : k;
   const B = b.available === false ? { notes: [], preferences: [] } : b;
   const unheld = new Set((K.unheld || []).map(r => r.slug));
-  const listOf = (rows, fn) => `<div class="box"><ul class="list">${rows.map(fn).join("")}</ul></div>`;
+  const listOf = (rows, fn) => rows.length ? `<div class="box"><ul class="list">${rows.map(fn).join("")}</ul></div>` : empty("Nothing saved yet", "Tell Claude Code what to remember, or use <code>/lfg:note</code>.");
   const rules = K.principles.map(p => ({ text: p.statement, why: p.rationale, s: p.status, kind: p.polarity === "forbids" ? "Never" : "Always" }))
     .concat(K.invariants.map(i => ({ text: i.statement, s: unheld.has(i.slug) ? "unheld" : i.status, kind: "Must stay true" })));
+  const missing = [k, b].filter(x => x.available === false).map(x => `<div class="callout warn">${fmtWhy(x.why)}</div>`).join("");
   return `${head("Knowledge", "What LFG remembers between sessions: decisions and lessons about this project, and your own preferences. Agents read these before they work.")}
+    ${missing}
     ${tabs("know", [
       ["dec", "Decisions", K.decisions.length, () => listOf(K.decisions, r => `<li><div class="grow"><div class="title">${esc(r.title)}</div><div class="meta">${esc(r.decision)}</div></div><span class="muted small nowrap">${ago(r.createdAt)}</span></li>`)],
       ["lrn", "Lessons learned", K.learnings.length, () => listOf(K.learnings, r => `<li><div class="grow"><div class="title">${esc(r.title)}</div><div class="meta">${esc((r.body || "").slice(0, 280))}</div></div><span class="muted small nowrap">${ago(r.createdAt)}</span></li>`)],
@@ -1010,7 +1035,7 @@ PAGES.knowledge = async () => {
       ["pref", "Your preferences", B.preferences.length, () => listOf(B.preferences, r => `<li><div class="grow"><div class="title">${esc(r.name || words(r.slug))}</div>${r.content ? `<div class="meta">${esc(String(r.content).slice(0, 280))}</div>` : ""}</div></li>`)],
       ["notes", "Your notes", B.notes.length, () => listOf(B.notes, r => `<li><div class="grow"><div class="title">${esc(r.name || words(r.slug))}</div>${r.content ? `<div class="meta">${esc(String(r.content).slice(0, 280))}</div>` : ""}</div><span class="muted small nowrap">${esc(words(r.kind))}</span></li>`)],
     ])}
-    <p class="muted small mt">To add something, tell Claude Code what to remember, or use <code>/note</code>.</p>`;
+    <p class="muted small mt">To add something, tell Claude Code what to remember, or use <code>/lfg:note</code>.</p>`;
 };
 
 PAGES.usage = async () => {
@@ -1024,14 +1049,15 @@ PAGES.usage = async () => {
     <div class="cols">${stat("Tokens sent", compact(t.input + t.cache_read + t.cache_write), `${hit}% reused from cache, which costs less`)}${stat("Tokens written", compact(t.output), "the AI's replies")}${stat("Saved by compression", hr.available && life.calls ? compact(life.tokens_saved) : "—", hr.available && life.calls ? `${life.savings_percent || 0}% smaller before sending${life.cost_usd ? ` · about ${usd(life.cost_usd)} saved, by Headroom's count` : ""}` : hr.pending ? `<span data-spend-pending>checking…</span>` : "not active yet")}</div>
     ${section("Per day", `<div class="box pad">${barChart((d.days || []).map(x => ({ label: x.day, values: [(x.input || 0) + (x.cache_write || 0), x.output] })), [["Sent (not cached)", "var(--chart-1)"], ["Written", "var(--chart-2)"]])}</div>`)}
     ${(d.models || []).length ? section("By model", `<div class="box">${table(d.models, [{ k: "model", label: "Model" }, { k: "input", label: "Sent", num: true, html: r => compact((r.input || 0) + (r.cache_read || 0)) }, { k: "output", label: "Written", num: true, html: r => compact(r.output) }], { filter: false })}</div>`) : ""}
-    ${sp.available && (sp.models || []).length ? section("Cost by model, last 30 days", `<div class="box">${table(sp.models, [{ k: "model", label: "Model" }, { k: "usd", label: "Cost", num: true, html: r => usd(r.usd) }], { filter: false })}</div>`) : ""}`;
+    ${sp.available && (sp.models || []).length ? section("Cost by model, last 30 days", `<div class="box">${table(sp.models, [{ k: "model", label: "Model" }, { k: "usd", label: "Cost", num: true, html: r => usd(r.usd) }], { filter: false })}</div>`) : ""}
+    ${(d.runs || []).length ? section(`${repoName()}, by run`, `<div class="box">${table(d.runs, [{ k: "run", label: "Run", html: r => r.run && r.run !== "(no run)" ? `<a href="#runs/${encodeURIComponent(r.run)}">${esc(runName({ slug: r.run.slice(14) }))}</a>` : '<span class="muted">Outside a run</span>' }, { k: "input", label: "Sent", num: true, html: r => compact((r.input || 0) + (r.cache_read || 0)) }, { k: "output", label: "Written", num: true, html: r => compact(r.output) }], { filter: false })}</div>`, "this project only, all time") : ""}`;
 };
 
 PAGES.settings = async () => {
   const [cfg, sk, cm, unlocked] = await Promise.all([api("settings"), api("skills"), api("claudemd"), isUnlocked()]);
   state.settings = { cfg, sk, cm, unlocked };
   return `${head("Settings", unlocked ? "Changes are checked, refused if they look like a password or key, and backed up." : "")}
-    ${unlocked ? "" : `<div class="notice">Read-only. To make changes, run <code>lfg ui</code> in your own terminal; it opens this page unlocked.</div>`}
+    ${unlocked ? "" : `<div class="callout">Read-only. To make changes, run <code>lfg ui</code> in your own terminal; it opens this page unlocked.</div>`}
     <div class="section">${tabs("settings", [["claudecode", "Claude Code", null, settingsClaudeCode], ["general", "General", null, settingsGeneral], ["tools", "Connections", null, settingsTools], ["ollama", "Local AI models", null, settingsOllama], ["storage", "Disk space", null, settingsStorage], ["rules", "Rules", null, settingsRules], ["claudemd", "Your instructions", null, settingsClaude]])}</div>`;
 };
 
@@ -1041,7 +1067,7 @@ PAGES.skills = async () => {
   const [sk, cm, unlocked] = await Promise.all([api("skills"), api("claudemd"), isUnlocked()]);
   state.settings = Object.assign(state.settings || {}, { sk, cm, unlocked, cfg: (state.settings || {}).cfg });
   return `${head("Skills", "Everything Claude Code can load as a skill on this computer: yours, this project's and every plugin's, LFG's included.")}
-    ${unlocked ? "" : `<div class="notice">Read-only. To change skills, run <code>lfg ui</code> in your own terminal; it opens this page unlocked.</div>`}
+    ${unlocked ? "" : `<div class="callout">Read-only. To change skills, run <code>lfg ui</code> in your own terminal; it opens this page unlocked.</div>`}
     <div class="section">${tabs("skillspage", [["all", "All skills", null, () => '<div id="skills-box"><div class="loading">Reading skills…</div></div>'], ["lfgedit", "Edit LFG skills", null, settingsSkills]])}</div>`;
 };
 async function loadSkills() {
@@ -1079,7 +1105,7 @@ async function showSkillText(id) {
 
 PAGES.help = async () => {
   const d = await api("guide");
-  return `${head("Help", `New here? Type <code>/wizard</code> in Claude Code for a guided run, or <code>/which</code> if you're not sure what to do next. LFG ${esc(d.version)}.`)}
+  return `${head("Help", `New here? Type <code>/lfg:wizard</code> in Claude Code for a guided run, or <code>/lfg:which</code> if you're not sure what to do next. LFG ${esc(d.version)}.`)}
     ${tabs("help", [
       ["guide", "Guide", null, () => d.has_guide ? `<iframe class="viewer" src="/guide/guide.html" title="LFG guide" referrerpolicy="no-referrer"></iframe>` : empty("The guide isn't installed", "Re-run <code>bootstrap.sh</code>.")],
       ["skills", "What you can ask for", d.skills.length, () => `<div class="box">${table(d.skills, [{ k: "name", label: "Command", html: r => `<code>/${esc(r.name)}</code>` }, { k: "description", label: "What it does" }])}</div>`],
@@ -1088,8 +1114,29 @@ PAGES.help = async () => {
 
 // ------------------------------------------------------------------ shell
 const NAV_GROUPS = [["Your work", ["home", "runs", "issues", "checks"]], ["This project", ["code", "docs", "knowledge"]], ["LFG", ["usage", "skills", "settings", "help"]]];
+/* 24px line icons, drawn for these pages (stroke = currentColor) */
+const ICON = {
+  home: "M3 10.5 12 3l9 7.5M5 9v11h5v-6h4v6h5V9",
+  runs: "M5 4l14 8-14 8z",
+  issues: "M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM12 13a1 1 0 1 0 0-2 1 1 0 0 0 0 2z",
+  checks: "M12 3l8 3v6c0 5-3.4 8.3-8 9-4.6-.7-8-4-8-9V6zM9 12l2 2 4-4",
+  code: "M8 7l-5 5 5 5M16 7l5 5-5 5M13.5 5l-3 14",
+  docs: "M14 3H6v18h12V7zM14 3v4h4M9 12h6M9 16h6",
+  knowledge: "M4 5.5C6.5 4 9.5 4 12 6c2.5-2 5.5-2 8-.5V19c-2.5-1.5-5.5-1.5-8 .5-2.5-2-5.5-2-8-.5zM12 6v13.5",
+  usage: "M4 20V10M10 20V4M16 20v-6M2 20h20",
+  skills: "M13 2 4 14h7l-1 8 9-12h-7z",
+  settings: "M4 7h9M17 7h3M4 17h3M11 17h9M15 9a2 2 0 1 0 0-4 2 2 0 0 0 0 4zM9 19a2 2 0 1 0 0-4 2 2 0 0 0 0 4z",
+  help: "M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM9.5 9.5a2.5 2.5 0 1 1 3.4 2.3c-.6.3-.9.8-.9 1.4v.3M12 17h.01",
+};
+const icon = (k, cls = "ico") => `<svg class="${cls}" viewBox="0 0 24 24" aria-hidden="true"><path d="${ICON[k] || ""}"/></svg>`;
 function renderNav(active) {
-  $("#nav").innerHTML = NAV_GROUPS.map(([g, ks]) => `<div class="nav-grp">${esc(g)}</div>${ks.map(k => `<a class="${k === active ? "on" : ""}" href="#${k}">${esc(TITLES[k])}</a>`).join("")}`).join("");
+  $("#nav").innerHTML = NAV_GROUPS.map(([g, ks]) => `<div class="nav-grp">${esc(g)}</div>${ks.map(k => `<a class="${k === active ? "on" : ""}" href="#${k}"${k === active ? ' aria-current="page"' : ""}>${icon(k)}<span>${esc(TITLES[k])}</span></a>`).join("")}`).join("");
+}
+/* Breadcrumb in the top bar: project / page / item. Pages that open an item call crumbs() again with it. */
+function crumbs(page, item, itemHref) {
+  const parts = [`<span class="crumb-proj">${esc(repoName() || "LFG")}</span>`, `<a href="#${page}">${icon(page)}${esc(TITLES[page] || page)}</a>`];
+  if (item) parts.push(itemHref ? `<a href="${itemHref}">${esc(item)}</a>` : `<span>${esc(item)}</span>`);
+  $("#crumbs").innerHTML = parts.join('<span class="sep">/</span>');
 }
 /* code map: build/update from the dashboard (the same background job the hooks start) */
 const mapBtn = (st, cls = "btn small") => st === "syncing" ? "" : st === "missing" ? `<button class="${cls} primary" data-map-build="update">Build now</button>`
@@ -1134,6 +1181,7 @@ async function route() {
   const key = PAGES[page] ? page : "home";
   const arg = rest.join("/");
   renderNav(key);
+  crumbs(key);
   document.title = `${TITLES[key]} · LFG`;
   const seq = ++renderSeq, view = $("#view");
   view.innerHTML = '<div class="skeleton" style="height:60px;width:40%"></div><div class="skeleton mt"></div><div class="skeleton mt" style="height:220px"></div>';

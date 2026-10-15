@@ -30,6 +30,20 @@ LFG no longer changes Claude Code for every session on the machine. It is now in
 - Skills are documented as `/lfg:<name>`, and `/lfg:which` recommends namespaced names.
 - Ignore entries go in each repo's `.git/info/exclude` instead of the global gitignore.
 
+### Dashboard
+- New look: a calm, document-style workspace in the spirit of Notion. It has warm neutral colours, system fonts, a sidebar with icons and project and branch switchers, a breadcrumb bar, large page titles, lists and tables on light dividers instead of boxes, tinted status labels, coloured callouts for what needs you, expandable toggles, a side panel for files, and a full dark theme. It fits at phone width with no sideways scrolling.
+- Data fixes found by checking every page against seeded runs, real code graphs and usage:
+  - The ship check's checklist was never shown ("0 of 0 checks passed"). It is now counted and listed, including items left for you to do and items that don't apply.
+  - Review feedback is matched to the run it was given on (finding IDs like R-1 repeat across runs).
+  - A run's "next step" names what is blocking it first, most serious first (failing checks, then a blocked review, a security problem, review changes, then the ship check), instead of the next missing file. Progress counts only the steps actually done, so a review-only run no longer shows "8 of 10".
+  - A pentest that didn't run is flagged. Run documents are listed in pipeline order.
+  - Home's "needs your attention" only nags about packs you added and says what to do ("GitHub CLI isn't signed in: run `gh auth login`"). The issues tile no longer shows 0 when dev-graph is unreachable, and a dev-graph that refuses LFG's token is explained with a fix.
+  - Home and Usage count tokens the same way.
+  - Code: test functions are left out of "where changes are riskiest", areas get readable folder names instead of `__init__.py`, and docstrings are labelled as what they are, with locations as `file:line`.
+  - Docs: vendored third-party files are no longer listed as your team's docs.
+  - Usage shows this project's tokens per run.
+  - Skill names are shown as `/lfg:<name>` throughout.
+
 ### Removed
 - Global `permissions.deny` rules, the global `CLAUDE.md` block, user-scope MCP registration, global gitignore and `core.excludesFile` changes, and routing all Claude Code traffic through Headroom by default.
 - References to design documents that weren't in the repository.

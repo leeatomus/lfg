@@ -173,7 +173,8 @@ def _about(d, review=None):
             break
     if not about and isinstance(review, dict):  # review-only runs: the review's own summary
         s = review.get("summary") or ""
-        about = "Review: " + "; ".join(str(v) for v in s.values()) if isinstance(s, dict) else str(s)
+        parts = [str(v).strip() for v in (s.values() if isinstance(s, dict) else [s]) if str(v).strip()]
+        about = " ".join(x if x.endswith((".", "!", "?")) else x + "." for x in parts)
     return title, about[:400]
 
 
@@ -183,6 +184,7 @@ def _run_summary(d):
     sc = C.read_json(os.path.join(d, "07-shipcheck.json"), None)
     rv = C.read_json(os.path.join(d, "06-review.json"), None)
     se = C.read_json(os.path.join(d, "05-secure.json"), None)
+    pt = C.read_json(os.path.join(d, "05-pentest.json"), None)
     tasks = C.read_json(os.path.join(d, "tasks.json"), None)
     tl = tasks if isinstance(tasks, list) else (tasks or {}).get("tasks", []) if isinstance(tasks, dict) else []
     stages = _stage_state(d)
@@ -194,6 +196,7 @@ def _run_summary(d):
             "stages": stages, "progress": sum(stages.values()),
             "ready": None if rd is None else ("green" if rd.get("green") else "red"),
             "review": (rv or {}).get("verdict"), "secure": _verdict((se or {}).get("verdict")),
+            "pentest": (pt or {}).get("status") if isinstance(pt, dict) else None,
             "shipcheck": None if sc is None else ("pass" if sc.get("pass") else "fail"),
             "tasks": {"total": len(tl), "done": sum(1 for t in tl if isinstance(t, dict) and t.get("passes"))}}
 
@@ -263,10 +266,10 @@ def code(rid, full=True):
             return {"file": f, "symbol": s}
 
         lim = 60 if full else 6
-        out["hotspots"] = [dict(sym(r[0]), risk=round(r[1], 2), callers=r[2], coverage=r[3], security=bool(r[4]))
-                           for r in q("SELECT qualified_name, risk_score, caller_count, test_coverage, "
-                                      "security_relevant FROM risk_index ORDER BY risk_score DESC, caller_count "
-                                      "DESC LIMIT ?", lim)]
+        hot = [dict(sym(r[0]), risk=round(r[1], 2), callers=r[2], coverage=r[3], security=bool(r[4]))
+               for r in q("SELECT qualified_name, risk_score, caller_count, test_coverage, security_relevant FROM "
+                          "risk_index ORDER BY risk_score DESC, caller_count DESC LIMIT ?", lim * 4)]
+        out["hotspots"] = [h for h in hot if not D.is_test(h["file"])][:lim]  # tests aren't where changes reach
         if not full:
             return out
         out["languages"] = dict(q("SELECT COALESCE(language,'?'), count(*) FROM nodes WHERE kind='File' "
@@ -300,6 +303,9 @@ def architecture(rid, full=True):
     nodes = g.get("nodes", [])
     deg = g["_degree"]
     byid = {n["id"]: n for n in nodes}
+    names = D._area_names(g)  # "Community 12" / "__init__.py" -> the area's shared folder
+    for n in nodes:
+        n["community_name"] = names.get(n.get("community_name"), n.get("community_name"))
     comm = collections.Counter(n.get("community_name") or "?" for n in nodes)
     gods = [byid[i] for i, _ in deg.most_common(80) if i in byid and byid[i].get("file_type") == "code"][:25]
     out = {"available": True, "nodes": len(nodes), "links": len(g.get("links", [])), "communities": len(comm),
@@ -317,8 +323,10 @@ def architecture(rid, full=True):
                              for c, s in comm.most_common(60)]
     rel = collections.Counter(e.get("relation") for e in g.get("links", []))
     out["relations"] = dict(rel.most_common(10))
-    out["rationale"] = [{"note": n.get("label"), "file": n.get("source_file"), "line": n.get("source_location")}
-                        for n in nodes if n.get("file_type") == "rationale"][:100]
+    notes = [n for n in nodes if n.get("file_type") == "rationale" and not D.is_test(n.get("source_file") or "")]
+    out["rationale_total"] = len(notes)
+    out["rationale"] = [{"note": n.get("label"), "file": n.get("source_file"),
+                         "line": str(n.get("source_location") or "").lstrip("Ll")} for n in notes][:100]
     s = D.report_sections(rid)
     out["report"] = {k: D.section(s, k) for k in ("Corpus Check", "Summary", "Surprising", "Import Cycles")}
     out["graph_html"] = bool(D.data(rid, "graphify")) and os.path.exists(D.data(rid, "graphify", "graph.html"))
@@ -357,6 +365,7 @@ def _title(path):
 
 
 MIN_AREA_NODES = 10
+THIRD_PARTY = D.THIRD_PARTY
 
 
 def docs_index(rid):
@@ -367,7 +376,7 @@ def docs_index(rid):
             pages = D.wiki_pages(rid)
             if sid == "guides":
                 items = [{"path": p["path"], "title": p["title"], "tag": "runbook" if p["runbook"] else ""}
-                         for p in pages if p["kind"] == "doc"]
+                         for p in pages if p["kind"] == "doc" and not all(THIRD_PARTY.search(x) for x in p["sources"])]
             else:
                 # areas big enough to be worth a page; tiny clusters and single-symbol pages are noise to a reader
                 items = [{"path": p["path"], "title": p["title"], "tag": "tests" if p["tests"] else ""}
@@ -475,6 +484,23 @@ def _og_ready(name):
         return False
 
 
+def og_access(name):
+    """None when `name` answers and accepts LFG's token; otherwise what's wrong and the fix, in plain words.
+    Cached briefly, since every LFG page asks."""
+    def check():
+        if not _og_ready(name):
+            from . import setup as SU
+            return ("%s isn't running. %s" % (name, "Add the Knowledge pack (`lfg add knowledge`)." if not
+                                              SU.pack_on("knowledge") else "Run `lfg omnigraph restart %s`." % name))
+        r = _og(lambda OG: OG.invoke(name, "ready" if name == "dev-graph" else "notes_recent"))
+        err = r.get("error") if isinstance(r, dict) else None
+        if err and re.search(r"unauthori[sz]ed|forbidden|401|403", str(err), re.I):
+            return ("%s is running but refused LFG's access token: another %s server may be using its port, or the "
+                    "tokens changed. Run `lfg omnigraph setup`." % (name, name))
+        return "%s answered with an error: %s" % (name, err) if err else None
+    return cached("og-access:" + name, 30, check)
+
+
 def _list(name, node, fields, order=None, limit=200):
     var = "$x"
     q = "query l() { match { %s: %s } return { %s }%s limit %d }" % (
@@ -492,8 +518,9 @@ def _rows(v):
 
 
 def issues():
-    if not _og_ready("dev-graph"):
-        return _na("dev-graph is not running. Run `lfg omnigraph status` (then `lfg omnigraph restart dev-graph`).")
+    why = og_access("dev-graph")
+    if why:
+        return _na(why)
     ws = C.config()["linear"].get("workspace") or ""
     allq = _list("dev-graph", "Issue", ["slug", "title", "description", "acceptanceCriteria", "status", "priority",
                                         "issueType", "legacyRef", "updatedAt"], "updatedAt", 300)
@@ -508,8 +535,9 @@ def issues():
 
 
 def knowledge():
-    if not _og_ready("dev-graph"):
-        return _na("dev-graph is not running. Run `lfg omnigraph status`.")
+    why = og_access("dev-graph")
+    if why:
+        return _na(why)
     return {
         "available": True,
         "decisions": _rows(_list("dev-graph", "Decision", ["slug", "title", "status", "decision", "createdAt"],
@@ -531,8 +559,9 @@ def knowledge():
 
 
 def brain():
-    if not _og_ready("second-brain"):
-        return _na("second-brain is not running. Run `lfg omnigraph status`.")
+    why = og_access("second-brain")
+    if why:
+        return _na(why)
     notes = _rows(_inv("second-brain", "notes_recent"))
     return {"available": True, "notes": notes,
             "kinds": dict(collections.Counter(n.get("kind") or "?" for n in notes)),
@@ -554,7 +583,9 @@ def reviews(rid, branch=None):
         run = os.path.basename(os.path.dirname(p))
         verdicts.append({"run": run, "verdict": rv.get("verdict"), "findings": len(rv.get("findings", []))})
         for f in rv.get("findings", []):
-            findings.append(dict(f, run=run, feedback=(fb.get(f.get("id")) or {}).get("verdict")))
+            v = fb.get("%s/%s" % (run, f.get("id"))) or fb.get(f.get("id")) or {}
+            mine = not v.get("run") or v.get("run") == run
+            findings.append(dict(f, run=run, feedback=v.get("verdict") if mine else None))
     for e in _audit(400):
         if e.get("event") == "blocked":
             blocked.append(e)
@@ -582,13 +613,31 @@ def security(rid, branch=None):
     ships = []
     for p in _run_files(rid, "07-shipcheck.json", branch)[:10]:
         s = C.read_json(p, {}) or {}
-        checks = (s.get("part_a") or {}).get("checks", []) + (s.get("part_b") or {}).get("checks", [])
-        ships.append({"run": os.path.basename(os.path.dirname(p)), "pass": s.get("pass"),
-                      "ok": sum(1 for c in checks if c.get("ok")), "total": len(checks),
-                      "failed": [c.get("check") for c in checks if c.get("ok") is False],
-                      "failures": [{"check": c.get("check"), "detail": str(c.get("detail") or "")[-1500:]}
-                                   for c in checks if c.get("ok") is False]})
+        checks = shipcheck_items(s)
+        counted = [c for c in checks if c["ok"] is not None]
+        ships.append({"run": os.path.basename(os.path.dirname(p)), "pass": s.get("pass"), "ts": s.get("ts"),
+                      "ok": sum(1 for c in counted if c["ok"]), "total": len(counted),
+                      "manual": [c["check"] for c in checks if c.get("manual")],
+                      "failed": [c["check"] for c in checks if c["ok"] is False],
+                      "checks": checks, "note": (s.get("part_a") or {}).get("note") or ""})
     return {"secure": sec, "pentest": pen, "shipcheck": ships}
+
+
+def shipcheck_items(s):
+    """Part A (Docker) checks and the shipping checklist of a 07-shipcheck.json as one list of
+    {check, ok: True|False|None, detail, part, manual}. ok None = not applicable or not run."""
+    out = []
+    for c in (s.get("part_a") or {}).get("checks", []):
+        warn = c.get("severity") == "warn"
+        out.append({"check": c.get("check"), "ok": c.get("ok") if not (warn and c.get("ok") is False) else None,
+                    "detail": str(c.get("detail") or "")[-1500:], "part": "container",
+                    "warning": warn and c.get("ok") is False})
+    for i in s.get("checklist") or (s.get("part_b") or {}).get("checks", []):
+        st = i.get("status")
+        ok = i.get("ok") if "ok" in i else True if st == "pass" else False if st == "fail" else None
+        out.append({"check": i.get("requirement") or i.get("check"), "ok": ok, "detail": i.get("detail") or "",
+                    "part": "checklist", "manual": st == "manual", "status": st})
+    return out
 
 
 # ---------------------------------------------------------------- usage + Headroom
@@ -744,6 +793,8 @@ def tools():
         mcp = _mcp_servers()
         gh = C.run(["gh", "auth", "status"], timeout=15).returncode == 0 if C.which("gh") else False
         pg = C.run(["pgrep", "-qi", "LuLu|Little Snitch"]).returncode == 0
+        docker_up = C.run(["docker", "info", "--format", "{{.ServerVersion}}"], timeout=15).returncode == 0 \
+            if C.which("docker") else False
         integrations = [
             {"name": "code-review-graph", "kind": "Code graph (MCP)", "ok": bool(versions["code-review-graph"]),
              "detail": "MCP: provided by the LFG plugin in repos where LFG is on"},
@@ -762,15 +813,21 @@ def tools():
              "detail": "proxy %s" % ("routing Claude Code" if _headroom_proxy_routed() else "off"),
              "optional": not SU.pack_on("headroom")},
             {"name": "GitHub (gh)", "kind": "PR/CI status, read-only", "ok": gh,
-             "detail": "signed in" if gh else "run `gh auth login` yourself"},
+             "detail": "signed in" if gh else "not signed in: run `gh auth login` yourself",
+             "problem": "GitHub CLI isn't signed in: run `gh auth login`" if C.which("gh") else
+             "GitHub CLI isn't installed: run `lfg setup`"},
             {"name": "Ollama", "kind": "Local model for /pentest", "ok": _http_ok("http://127.0.0.1:11434/api/tags"),
-             "detail": "only needed for /pentest", "optional": True},
+             "detail": "only needed for /lfg:pentest", "optional": not SU.pack_on("pentest"),
+             "problem": "Ollama isn't running: open the Ollama app"},
             {"name": "Egress firewall", "kind": "LuLu / Little Snitch", "ok": pg,
-             "detail": "running" if pg else "not running; /pentest refuses to start without it", "optional": True},
-            {"name": "Docker", "kind": "Ship check, pentest sandbox",
-             "ok": C.run(["docker", "info", "--format", "{{.ServerVersion}}"], timeout=15).returncode == 0
-             if C.which("docker") else False, "detail": "daemon"},
+             "detail": "running" if pg else "not running; /lfg:pentest refuses to start without it",
+             "optional": not SU.pack_on("pentest"), "problem": "No egress firewall running: open LuLu"},
+            {"name": "Docker", "kind": "Ship check, pentest sandbox", "ok": docker_up,
+             "detail": "running" if docker_up else "not running", "optional": not SU.pack_on("shipcheck"),
+             "problem": "Docker isn't running: start Docker Desktop (or Colima)"},
         ]
+        for i in integrations:
+            i.setdefault("problem", "%s: %s" % (i["name"], re.sub(r"^MCP:\s*", "", i["detail"])))
         return {"tools": rows, "integrations": integrations, "mcp": mcp, "checked_at": C.now_iso()}
     return cached("tools", 300, get)
 
@@ -780,8 +837,10 @@ def tools_quick():
     hit = _CACHE.get("tools")
     if hit:
         return hit[1]["integrations"]
-    return [{"name": "dev-graph", "ok": _og_ready("dev-graph")},
-            {"name": "second-brain", "ok": _og_ready("second-brain")}]
+    from . import setup as SU
+    off = not SU.pack_on("knowledge")
+    return [{"name": n, "ok": _og_ready(n), "optional": off, "problem": "%s isn't running: run `lfg omnigraph restart "
+             "%s`" % (n, n)} for n in ("dev-graph", "second-brain")]
 
 
 # ---------------------------------------------------------------- overview
@@ -821,10 +880,10 @@ def overview(rid, branch=None):
     cur = next((r for r in rs if r.get("current")), rs[0] if rs else None)
     u = usage(rid)
     week = [d for d in u["days"] if d["day"] >= time.strftime("%Y-%m-%d", time.localtime(time.time() - 7 * 86400))]
-    work = None
-    if _og_ready("dev-graph"):
-        work = {"ready": len(_rows(_inv("dev-graph", "ready"))), "blocked": len(_rows(_inv("dev-graph", "blocked"))),
-                "epics": len(_rows(_inv("dev-graph", "open_epics")))}
+    why = og_access("dev-graph")
+    work = {"why": why} if why else {"ready": len(_rows(_inv("dev-graph", "ready"))),
+                                     "blocked": len(_rows(_inv("dev-graph", "blocked"))),
+                                     "epics": len(_rows(_inv("dev-graph", "open_epics")))}
     sec = security(rid, branch)
     return {
         "graphs": graph_state(rid), "code": code(rid, full=False), "architecture": architecture(rid, full=False),
