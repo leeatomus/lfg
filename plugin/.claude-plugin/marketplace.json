@@ -1,0 +1,13 @@
+{
+  "name": "lfg",
+  "owner": { "name": "Varun Singh", "url": "https://github.com/varun-singhh" },
+  "metadata": { "description": "Local marketplace for the LFG plugin, installed at ~/.lfg/plugin by `lfg setup`." },
+  "plugins": [
+    {
+      "name": "lfg",
+      "source": "./",
+      "description": "LFG engineering pipeline for Claude Code.",
+      "defaultEnabled": false
+    }
+  ]
+}

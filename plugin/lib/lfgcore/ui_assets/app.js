@@ -1,0 +1,1202 @@
+/* LFG dashboard: a plain-language view of what LFG is doing in your repos. Read-only, except Settings, which saves
+   only with the local edit key from `lfg ui`. Author: Varun Singh. No external resources. */
+"use strict";
+
+// ------------------------------------------------------------------ helpers
+const $ = (s, el = document) => el.querySelector(s);
+const $$ = (s, el = document) => [...el.querySelectorAll(s)];
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const n = v => (v == null || v === "" ? "—" : Number(v).toLocaleString());
+function compact(v) {
+  if (v == null || isNaN(v)) return "—";
+  const a = Math.abs(v);
+  if (a >= 1e9) return (v / 1e9).toFixed(1).replace(/\.0$/, "") + "B";
+  if (a >= 1e6) return (v / 1e6).toFixed(1).replace(/\.0$/, "") + "M";
+  if (a >= 1e3) return (v / 1e3).toFixed(1).replace(/\.0$/, "") + "k";
+  return String(v);
+}
+function ago(ts) {
+  if (!ts) return "never";
+  if (/^\d{4}-\d{2}-\d{2}$/.test(ts)) {  // day-granular (Omnigraph Date): compare calendar days, local time
+    const t = new Date(), days = Math.round((new Date(t.getFullYear(), t.getMonth(), t.getDate()) - new Date(ts + "T00:00")) / 864e5);
+    return days <= 0 ? "today" : days === 1 ? "yesterday" : days + " days ago";
+  }
+  const s = (Date.now() - new Date(ts).getTime()) / 1000;
+  if (isNaN(s)) return esc(ts);
+  if (s < 60) return "just now";
+  if (s < 3600) return Math.floor(s / 60) + " min ago";
+  if (s < 86400) return Math.floor(s / 3600) + " h ago";
+  const d = Math.floor(s / 86400);
+  return d === 1 ? "yesterday" : d + " days ago";
+}
+const pct = (a, b) => (b ? Math.round((100 * a) / b) : 0);
+const plural = (k, w) => `${n(k)} ${w}${k === 1 ? "" : "s"}`;
+const words = s => String(s || "").replace(/[-_]+/g, " ").replace(/\.md$/, "");
+const state = { repo: localStorage.getItem("lfg.repo") || "", branch: "", repos: [], cache: {} };
+const branchPref = () => "lfg.branch." + state.repo;
+
+async function api(view, params = {}) {
+  const q = new URLSearchParams({ repo: state.repo, ...(state.branch ? { branch: state.branch } : {}), ...params });
+  const r = await fetch(`/api/${view}?${q}`, { headers: { "X-LFG": "1" } });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.json();
+}
+
+const repoName = (id = state.repo) => (state.repos || []).find(x => x.id === id)?.name || id;
+const usd = v => "$" + (v >= 100 ? Math.round(v).toLocaleString() : v.toFixed(2));
+// ------------------------------------------------------------------ plain words for tool status values
+/* Every status value the tools write, as [what a person reads, tone]. Unknown values show as written. */
+const SAY = {
+  // checks before commit (ready.json)
+  green: ["Checks pass", "ok"], red: ["Checks failing", "bad"],
+  // review verdict
+  approve: ["Approved", "ok"], changes: ["Changes requested", "warn"], block: ["Blocked", "bad"],
+  // security verdict
+  safe: ["No problems", "ok"], "safe with caveats": ["Minor notes", "warn"], "don't": ["Problems to fix", "bad"],
+  // ship check
+  pass: ["Passed", "ok"], fail: ["Failed", "bad"],
+  // graphs
+  fresh: ["Up to date", "ok"], stale: ["Out of date", "warn"], syncing: ["Updating", "warn"], missing: ["Not built yet", "warn"], error: ["Error", "bad"],
+  // issues and knowledge
+  backlog: ["Backlog", ""], todo: ["To do", ""], in_progress: ["In progress", "on"], needs_review: ["In review", "warn"], hold: ["On hold", "warn"],
+  done: ["Done", "ok"], canceled: ["Canceled", ""], duplicate: ["Duplicate", ""],
+  accepted: ["Accepted", "ok"], proposed: ["Proposed", "warn"], rejected: ["Rejected", ""], superseded: ["Replaced", ""],
+  holds: ["Holds", "ok"], violated: ["Broken", "bad"], unheld: ["Not checked by a test", "warn"],
+  active: ["Active", "ok"], relaxed: ["Relaxed", ""], retired: ["Retired", ""],
+  narrowing: ["Shrinking", "ok"], widened: ["Growing", "bad"], closed: ["Closed", "ok"],
+  // review severity
+  blocker: ["Must fix", "bad"], major: ["Should fix", "warn"], minor: ["Minor", ""], nit: ["Nitpick", ""],
+  critical: ["Critical", "bad"], high: ["High", "bad"], medium: ["Medium", "warn"], moderate: ["Medium", "warn"], low: ["Low", ""],
+  accept: ["You agreed", "ok"], reject: ["You disagreed", ""],
+  // security test (pentest)
+  refused: ["Didn't run", "warn"], completed: ["Finished", "ok"], findings: ["Found problems", "bad"],
+};
+const say = v => SAY[String(v ?? "").toLowerCase()] || [v == null || v === "" ? "" : String(v), ""];
+function st(v, fallback) {
+  const [text, t] = say(v);
+  if (!text) return `<span class="muted">${esc(fallback || "—")}</span>`;
+  return `<span class="st"><span class="dot ${t}"></span>${esc(text)}</span>`;
+}
+const dot = t => `<span class="dot ${t}"></span>`;
+const fmtWhy = w => esc(w || "").replace(/`([^`]+)`/g, "<code>$1</code>");
+
+/* Pipeline steps, in the words a person uses */
+const STEP = { brief: "Idea written up", design: "Plan", tasks: "Task list", build: "Built", qa: "Tested", gate: "Checks run",
+  secure: "Security check", review: "Code review", ship: "Ship check", packet: "Ready to commit" };
+const NEXT = { brief: "write up the idea", design: "make a plan", tasks: "split it into tasks", build: "build it", qa: "test it",
+  gate: "run the checks", secure: "check security", review: "review the code", ship: "run the ship check", packet: "prepare the commit message" };
+function runPlace(stages, done) {
+  /* where the run is = the furthest step done (review-only runs skip the early steps) */
+  const keys = stages.map(s => s[0]), last = keys.reduce((a, x, i) => (done[x] ? i : a), -1);
+  const next = keys.slice(last + 1)[0];
+  return { done: last + 1, total: keys.length, next, finished: !next };
+}
+const runName = r => r.title || words(r.slug || "untitled run");
+
+// ------------------------------------------------------------------ components
+function empty(title, body) {
+  return `<div class="empty"><h3>${esc(title)}</h3><div>${body || ""}</div></div>`;
+}
+function unavailable(d, title) {
+  return `<div class="box">${empty(title || "Not available yet", fmtWhy(d && d.why))}</div>`;
+}
+function head(title, text, back) {
+  return `<div class="head">${back || ""}<h1>${esc(title)}</h1>${text ? `<p>${text}</p>` : ""}</div>`;
+}
+function section(title, body, sub) {
+  return `<div class="section"><h2>${esc(title)}${sub ? `<span class="sub">${sub}</span>` : ""}</h2>${body}</div>`;
+}
+function stat(k, v, s) {
+  return `<div class="box stat"><div class="k">${esc(k)}</div><div class="v">${v}</div>${s ? `<div class="s">${s}</div>` : ""}</div>`;
+}
+
+/* table(rows, cols, opts): cols = [{k, label, num, html: row => string, sort: row => value}] */
+let TID = 0;
+const TABLES = {};
+function table(rows, cols, opts = {}) {
+  const id = "t" + ++TID;
+  if (!rows || !rows.length) return empty(opts.emptyTitle || "Nothing here yet", opts.emptyBody || "");
+  TABLES[id] = { rows, cols, opts, sort: opts.sort || null, dir: opts.dir || -1, filter: "" };
+  const tools = rows.length > 15 && opts.filter !== false ?
+    `<div class="table-tools"><input type="search" placeholder="Search…" data-filter="${id}"><span class="count" id="${id}-count"></span></div>` : "";
+  return `${tools}<div class="table-wrap"><table id="${id}"></table></div>`;
+}
+function drawTable(id) {
+  const t = TABLES[id], el = document.getElementById(id);
+  if (!t || !el) return;
+  const f = t.filter.toLowerCase();
+  const rows = f ? t.rows.filter(r => JSON.stringify(r).toLowerCase().includes(f)) : t.rows.slice();
+  if (t.sort != null) {
+    const c = t.cols.find(c => c.k === t.sort);
+    const val = r => (c && c.sort ? c.sort(r) : r[t.sort]);
+    rows.sort((a, b) => {
+      const x = val(a), y = val(b);
+      if (x == null) return 1; if (y == null) return -1;
+      return (typeof x === "number" && typeof y === "number" ? x - y : String(x).localeCompare(String(y))) * t.dir;
+    });
+  }
+  const shown = rows.slice(0, t.opts.limit || 500);
+  el.innerHTML = `<thead><tr>${t.cols.map(c => `<th data-k="${esc(c.k)}" class="${c.num ? "num" : ""} ${t.sort === c.k ? (t.dir > 0 ? "sorted-asc" : "sorted-desc") : ""}">${esc(c.label)}</th>`).join("")}</tr></thead>
+    <tbody>${shown.map(r => `<tr class="${t.opts.onRow ? "click" : ""}" data-i="${t.rows.indexOf(r)}">${t.cols.map(c => `<td class="${c.num ? "num" : ""}">${c.html ? c.html(r) : c.num ? n(r[c.k]) : esc(r[c.k])}</td>`).join("")}</tr>`).join("")}</tbody>`;
+  const cnt = document.getElementById(id + "-count");
+  if (cnt) cnt.textContent = rows.length === t.rows.length ? plural(rows.length, "item") : `${n(rows.length)} of ${n(t.rows.length)}`;
+  $$("th", el).forEach(th => th.onclick = () => { const k = th.dataset.k; t.dir = t.sort === k ? -t.dir : -1; t.sort = k; drawTable(id); });
+  if (t.opts.onRow) $$("tbody tr", el).forEach(tr => tr.onclick = () => t.opts.onRow(t.rows[+tr.dataset.i]));
+}
+function mountTables(root = document) {
+  $$("table[id^=t]", root).forEach(el => drawTable(el.id));
+  $$("input[data-filter]", root).forEach(inp => inp.oninput = () => { TABLES[inp.dataset.filter].filter = inp.value; drawTable(inp.dataset.filter); });
+}
+
+/* tabs(id, [[key, label, count, htmlFn]]): renders lazily; tabs with a 0 count are left out unless all are empty */
+const TABS = {};
+function tabs(id, items) {
+  const shown = items.filter(it => it[2] == null || it[2] > 0);
+  const list = shown.length ? shown : items.slice(0, 1);
+  TABS[id] = list;
+  return `<div class="tabs" data-tabs="${id}">${list.map(([k, l, c]) => `<button class="tab" data-k="${esc(k)}">${esc(l)}${c ? `<span class="n">${compact(c)}</span>` : ""}</button>`).join("")}</div><div id="${id}-body"></div>`;
+}
+function mountTabs(root = document) {
+  $$("[data-tabs]", root).forEach(bar => {
+    const id = bar.dataset.tabs;
+    const show = k => {
+      $$(".tab", bar).forEach(b => b.classList.toggle("on", b.dataset.k === k));
+      const it = TABS[id].find(x => x[0] === k);
+      const body = document.getElementById(id + "-body");
+      body.innerHTML = it[3]();
+      mountTables(body); mountTabs(body); wire(body);
+      sessionStorage.setItem("lfg.tab." + id, k);
+    };
+    $$(".tab", bar).forEach(b => b.onclick = () => show(b.dataset.k));
+    const saved = sessionStorage.getItem("lfg.tab." + id);
+    show(TABS[id].some(x => x[0] === saved) ? saved : TABS[id][0][0]);
+  });
+}
+
+/* simple bar chart: data=[{label, values:[...]}], series=[[name,color]] */
+function barChart(data, series, h = 160) {
+  if (!data.length) return '<div class="muted small">Nothing recorded in this period.</div>';
+  const W = 760, P = 34, bw = Math.max(4, Math.min(24, (W - P - 10) / data.length - 4));
+  const max = Math.max(...data.map(d => d.values.reduce((a, b) => a + (b || 0), 0)), 1);
+  const x = i => P + 6 + i * ((W - P - 10) / data.length);
+  let bars = "";
+  data.forEach((d, i) => {
+    let y = h - 20;
+    d.values.forEach((v, j) => {
+      const bh = ((v || 0) / max) * (h - 34);
+      y -= bh;
+      bars += `<rect x="${x(i)}" y="${y}" width="${bw}" height="${bh}" rx="2" style="fill:${series[j][1]}"><title>${esc(d.label)} · ${esc(series[j][0])}: ${n(v)}</title></rect>`;
+    });
+    if (data.length <= 16 || i % Math.ceil(data.length / 8) === 0) bars += `<text x="${x(i) + bw / 2}" y="${h - 6}" text-anchor="middle">${esc(d.label.slice(5))}</text>`;
+  });
+  const ticks = [0, 1].map(t => `<line class="axis" x1="${P}" x2="${W}" y1="${h - 20 - t * (h - 34)}" y2="${h - 20 - t * (h - 34)}"/><text x="${P - 4}" y="${h - 17 - t * (h - 34)}" text-anchor="end">${compact(Math.round(max * t))}</text>`).join("");
+  return `<div class="chart"><svg viewBox="0 0 ${W} ${h}" role="img">${ticks}${bars}</svg></div><div class="legend">${series.map(([s, c]) => `<span><i style="background:${c}"></i>${esc(s)}</span>`).join("")}</div>`;
+}
+
+// ------------------------------------------------------------------ markdown (safe: escape first, allow-list links)
+function inline(s, link) {
+  const codes = [];
+  s = esc(s).replace(/`([^`]+)`/g, (_, c) => { codes.push(c); return `\u0000${codes.length - 1}\u0000`; });
+  s = s.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_, t, u) => {
+    const raw = u.replace(/&amp;/g, "&");
+    if (/^https?:\/\//i.test(raw)) return `<a href="${esc(raw)}" target="_blank" rel="noopener noreferrer">${t}</a>`;
+    const xd = link && /^lfgdoc:([a-z]+)\/(.+\.md)$/i.exec(raw);  // link to another docs source
+    if (xd) return `<a href="#docs/${esc(xd[1])}/${esc(encodeURIComponent(xd[2]))}">${t}</a>`;
+    if (link && /\.md(#.*)?$/i.test(raw) && !/^[a-z]+:/i.test(raw)) return `<a href="#" data-doclink="${esc(raw)}">${t}</a>`;
+    return t;
+  });
+  s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>").replace(/(^|[\s(])_([^_]+)_(?=[\s).,;:]|$)/g, "$1<em>$2</em>")
+    .replace(/(^|[\s(])\*([^*]+)\*(?=[\s).,;:]|$)/g, "$1<em>$2</em>");
+  return s.replace(/\u0000(\d+)\u0000/g, (_, i) => `<code>${codes[+i]}</code>`);
+}
+function md(text, link) {
+  const L = String(text || "").replace(/\r/g, "").split("\n");
+  let out = "", i = 0;
+  const para = [];
+  const flush = () => { if (para.length) { out += `<p>${inline(para.join(" "), link)}</p>`; para.length = 0; } };
+  while (i < L.length) {
+    const l = L[i];
+    if (/^```/.test(l)) {
+      flush(); const buf = []; i++;
+      while (i < L.length && !/^```/.test(L[i])) buf.push(L[i++]);
+      i++; out += `<pre><code>${esc(buf.join("\n"))}</code></pre>`; continue;
+    }
+    if (/^\s*\|.*\|\s*$/.test(l) && i + 1 < L.length && /^\s*\|?[\s:-]+\|[\s|:-]*$/.test(L[i + 1])) {
+      flush();
+      const cells = r => r.trim().replace(/^\||\|$/g, "").split(/(?<!\\)\|/).map(c => c.trim().replace(/\\\|/g, "|"));
+      const hd = cells(l); i += 2; const body = [];
+      while (i < L.length && /^\s*\|/.test(L[i])) body.push(cells(L[i++]));
+      out += `<table><thead><tr>${hd.map(h => `<th>${inline(h, link)}</th>`).join("")}</tr></thead><tbody>${body.map(r => `<tr>${r.map(c => `<td>${inline(c, link)}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
+      continue;
+    }
+    let m;
+    if ((m = l.match(/^(#{1,4})\s+(.*)$/))) { flush(); out += `<h${m[1].length}>${inline(m[2], link)}</h${m[1].length}>`; i++; continue; }
+    if (/^\s*(---|\*\*\*)\s*$/.test(l)) { flush(); out += "<hr>"; i++; continue; }
+    if (/^>\s?/.test(l)) {
+      flush(); const buf = [];
+      while (i < L.length && /^>\s?/.test(L[i])) buf.push(L[i++].replace(/^>\s?/, ""));
+      out += `<blockquote>${md(buf.join("\n"), link)}</blockquote>`; continue;
+    }
+    if (/^\s*([-*+]|\d+\.)\s+/.test(l)) {
+      flush(); const ordered = /^\s*\d+\./.test(l); const buf = [];
+      while (i < L.length && /^\s*([-*+]|\d+\.)\s+/.test(L[i])) {
+        let item = L[i++].replace(/^\s*([-*+]|\d+\.)\s+/, "");
+        while (i < L.length && /^\s{2,}\S/.test(L[i]) && !/^\s*([-*+]|\d+\.)\s+/.test(L[i])) item += " " + L[i++].trim();
+        buf.push(item);
+      }
+      out += `<${ordered ? "ol" : "ul"}>${buf.map(b => `<li>${inline(b, link)}</li>`).join("")}</${ordered ? "ol" : "ul"}>`; continue;
+    }
+    if (!l.trim()) { flush(); i++; continue; }
+    para.push(l.trim()); i++;
+  }
+  flush();
+  return out;
+}
+
+// ------------------------------------------------------------------ drawer (file viewer)
+function openDrawer(title, html) {
+  $("#drawer-title").textContent = title;
+  $("#drawer-body").innerHTML = html;
+  $("#drawer").hidden = false;
+  mountTables($("#drawer-body"));
+}
+function closeDrawer() { $("#drawer").hidden = true; }
+function renderFile(name, text) {
+  if (/\.md$/i.test(name)) return `<div class="md">${md(frontMatter(text).body)}</div>`;
+  if (/\.json$/i.test(name)) {
+    let d;
+    try { d = JSON.parse(text); } catch (e) { d = undefined; }
+    if (d !== undefined) { const v = JSON_VIEWS[name.split("/").pop()]; return `<div class="readable">${v ? v(d) : readable(d)}</div>`; }
+  }
+  return `<pre class="raw">${esc(text)}</pre>`;
+}
+
+// ------------------------------------------------------------------ readable views (never raw JSON)
+const txt = v => inline(typeof v === "string" ? v : v == null ? "" : String(v));
+const label = k => { const s = words(k).replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase(); return s.charAt(0).toUpperCase() + s.slice(1); };
+/* Any JSON as headings, lists and sentences */
+function readable(v) {
+  if (v == null || v === "") return '<span class="muted">—</span>';
+  if (typeof v === "boolean") return v ? "Yes" : "No";
+  if (typeof v !== "object") return txt(v);
+  if (Array.isArray(v)) {
+    if (!v.length) return '<span class="muted">None</span>';
+    if (v.every(x => x == null || typeof x !== "object")) return `<ul>${v.map(x => `<li>${readable(x)}</li>`).join("")}</ul>`;
+    return v.map(x => `<div class="card">${readable(x)}</div>`).join("");
+  }
+  return `<dl class="kv">${Object.entries(v).map(([k, x]) => `<dt>${esc(label(k))}</dt><dd>${readable(x)}</dd>`).join("")}</dl>`;
+}
+function moreDetails(d, skip) {
+  const r = Object.fromEntries(Object.entries(d || {}).filter(([k, v]) => !skip.includes(k) && v != null && v !== "" && !(Array.isArray(v) && !v.length)));
+  return Object.keys(r).length ? `<details class="more"><summary>More details</summary>${readable(r)}</details>` : "";
+}
+const AXIS = { standards: "Coding standards", spec: "Does what was asked", blast_radius: "Effect on other code", blast: "Effect on other code" };
+/* One review or security finding: what's wrong, why, what to do, where */
+function findingCard(f) {
+  // scanner findings (lfg secure) have an id, item and evidence instead of a title
+  const ev = [].concat(f.evidence || []).map(String);
+  const head = f.title || f.finding || f.message || (f.type === "vuln" && f.item ? `${f.item} has a known vulnerability (${f.id})` : ev[0] && f.type === "code" ? ev[0] : f.item || f.id) || "Finding";
+  const more = f.title ? f.detail || f.finding || f.message : f.detail;
+  const where = f.file ? f.file + (f.line ? ":" + f.line : "") : f.where || f.package || f.target || "";
+  const links = ev.filter(x => /^https?:\/\//.test(x));
+  return `<div class="card"><div class="row">${st(f.severity)}${f.blocking === true ? '<span class="tag">must fix before shipping</span>' : ""}${f.axis ? `<span class="tag">${esc(AXIS[f.axis] || words(f.axis))}</span>` : ""}${f.feedback ? st(f.feedback) : ""}</div>
+    <div class="title">${txt(head)}</div>
+    ${more ? `<p>${txt(more)}</p>` : ""}
+    ${f.fix ? `<p><b>What to do:</b> ${txt(f.fix)}</p>` : ""}
+    ${f.reachable ? `<p class="muted small">Can an attacker reach it? ${txt(f.reachable)}</p>` : ""}
+    ${f.principle && f.principle !== "None" ? `<p class="muted small">Based on: ${txt(f.principle)}</p>` : ""}
+    ${links.length ? `<p class="small">${links.map(u => `<a href="${esc(u)}" target="_blank" rel="noopener noreferrer">Read the advisory ↗</a>`).join(" · ")}</p>` : ""}
+    ${where ? `<div class="muted small mono">${esc(where)}</div>` : ""}</div>`;
+}
+const SEV_RANK = { blocker: 0, critical: 0, high: 1, major: 1, medium: 2, moderate: 2, minor: 3, low: 3, nit: 4 };
+const sevRank = f => (f.blocking === true ? -1 : 0) + (SEV_RANK[String(f.severity).toLowerCase()] ?? 5);
+const findingList = (fs, none) => (fs || []).length ? [...fs].sort((a, b) => sevRank(a) - sevRank(b)).map(findingCard).join("") : `<p class="muted">${esc(none || "Nothing found.")}</p>`;
+/* A task: its description, opening to the steps and how it's checked */
+function taskItem(t) {
+  if (!t || typeof t !== "object") return "";
+  const steps = Array.isArray(t.steps) ? t.steps : [], deps = Array.isArray(t.depends_on) ? t.depends_on : [];
+  const body = `${steps.length ? `<div class="k">Steps</div><ol>${steps.map(s => `<li>${txt(s)}</li>`).join("")}</ol>` : ""}
+    ${t.verification ? `<div class="k">How we know it works</div><p>${txt(t.verification)}</p>` : ""}
+    ${t.notes ? `<div class="k">Notes</div><p>${txt(t.notes)}</p>` : ""}
+    ${deps.length ? `<p class="muted small">Waits for: ${esc(deps.join(", "))}</p>` : ""}`;
+  return `<details class="item"><summary>${dot(t.passes ? "ok" : "")}<span class="grow">${txt(t.description || t.id || "Task")}</span><span class="muted small nowrap">${t.passes ? "done" : "to do"}</span></summary><div class="item-body">${body}</div></details>`;
+}
+/* A check that ran (tests, lint, ship check): failed ones open to show the error */
+function checkItem(name, result, out, cmd) {
+  const [word, tone] = { pass: ["passed", "ok"], fail: ["failed", "bad"], skip: ["not run", ""] }[result];
+  const body = result !== "pass" && out ? `${cmd ? `<div class="muted small mono">${esc(cmd)}</div>` : ""}<pre class="out">${esc(out)}</pre>` : "";
+  return `<details class="item${body ? "" : " plain"}"><summary>${dot(tone)}<span class="grow">${esc(words(name))}</span><span class="muted small nowrap">${word}</span></summary>${body ? `<div class="item-body">${body}</div>` : ""}</details>`;
+}
+const readyChecks = cs => (cs || []).map(c => checkItem(c.name, c.exit === 0 ? "pass" : c.exit == null ? "skip" : "fail", c.tail, c.cmd)).join("");
+const shipChecks = cs => (cs || []).map(c => checkItem(c.check || c.name, c.ok ? "pass" : c.ok == null ? "skip" : "fail", c.detail)).join("");
+const verdictOf = v => (v && typeof v === "object" ? v.overall : v);
+const JSON_VIEWS = {
+  "06-review.json": d => `<p>${st(d.verdict)}</p>${typeof d.summary === "string" ? `<p>${txt(d.summary)}</p>` : d.summary ? readable(d.summary) : ""}
+    <h3>Findings</h3>${findingList(d.findings, "The review found nothing to change.")}${moreDetails(d, ["verdict", "summary", "findings", "run", "base", "lane", "remember"])}`,
+  "05-secure.json": d => `<p>${st(verdictOf(d.verdict))}</p>${d.scope ? `<p class="muted">Checked: ${txt(d.scope)}</p>` : ""}
+    <h3>Findings</h3>${findingList(d.findings, "No security problems found.")}${moreDetails(d, ["verdict", "scope", "findings", "ts", "run"])}`,
+  "05-pentest.json": d => `<p>${st(d.status)}</p>${d.summary || d.conclusion ? `<p>${txt(d.summary || d.conclusion)}</p>` : ""}
+    ${(d.preflight_failures || []).length ? `<h3>Why it didn't run</h3><ul>${d.preflight_failures.map(x => `<li>${txt(x)}</li>`).join("")}</ul>` : ""}
+    ${d.next_steps ? `<h3>What to do next</h3><p>${txt(d.next_steps)}</p>` : ""}
+    ${(d.findings || []).length ? `<h3>Findings</h3>${findingList(d.findings)}` : ""}${moreDetails(d, ["status", "summary", "conclusion", "preflight_failures", "next_steps", "findings", "ts", "ran"])}`,
+  "tasks.json": d => { const l = Array.isArray(d) ? d : d.tasks || []; return l.length ? l.map(taskItem).join("") : '<p class="muted">No tasks.</p>'; },
+  "ready.json": d => `<p>${st(d.green ? "green" : "red")}</p>${readyChecks(d.checks)}`,
+  "07-shipcheck.json": d => `<p>${st(d.pass ? "pass" : "fail")}</p>${shipChecks([].concat((d.part_a || {}).checks || [], (d.part_b || {}).checks || []))}${moreDetails(d, ["pass", "part_a", "part_b", "ts", "run"])}`,
+};
+/* Skill and rule files start with a YAML header; show its description, not the YAML */
+function frontMatter(text) {
+  const m = /^---\n([\s\S]*?)\n---\n?/.exec(String(text || ""));
+  if (!m) return { meta: {}, body: String(text || "") };
+  const meta = {};
+  let key = null;  // "key: value", or "key: >" / "key: |" followed by indented lines
+  m[1].split("\n").forEach(l => {
+    const k = /^([\w-]+):\s*(.*)$/.exec(l);
+    if (k) { key = k[1]; meta[key] = /^[>|][-+]?$/.test(k[2]) ? "" : k[2].replace(/^["']|["']$/g, ""); }
+    else if (key && /^\s+\S/.test(l)) meta[key] = (meta[key] ? meta[key] + " " : "") + l.trim();
+  });
+  return { meta, body: text.slice(m[0].length) };
+}
+function wire(root) {
+  $$("[data-run-file]", root).forEach(a => a.onclick = async e => {
+    e.preventDefault();
+    const [run, f] = JSON.parse(a.dataset.runFile);
+    const d = await api("file", { run, f });
+    openDrawer(a.textContent, renderFile(f, d.text));
+  });
+  $$("[data-view]", root).forEach(b => b.onclick = async () => {
+    const box = document.getElementById(b.dataset.target);
+    box.innerHTML = '<div class="loading">Opening… large repos can take a minute the first time.</div>';
+    const d = await api("view", { kind: b.dataset.view });
+    box.innerHTML = d.src ? `<iframe class="viewer mt" src="${esc(d.src)}" title="${esc(b.textContent)}" referrerpolicy="no-referrer"></iframe>` : empty("Not made yet", fmtWhy(d.message));
+  });
+  $$("[data-rule-module]", root).forEach(a => a.onclick = e => {
+    e.preventDefault();
+    const m = (state.rules.modules || []).find(x => x.name === a.dataset.ruleModule);
+    if (m) openDrawer(words(m.name), renderFile(m.name + ".md", m.text));
+  });
+  wireSettings(root);
+  wireMap(root);
+  if ($("[data-spend-pending]", root)) setTimeout(() => { if (document.body.contains(root) && $("[data-spend-pending]", root)) route(); }, 4000);
+}
+
+// ------------------------------------------------------------------ rules: hover any mention to see what it means
+const RULE_RX = /\b(?:[Rr]ule (\d{1,2})\b|lfg rule ([a-z][a-z-]+))/g;
+function ruleTip(num, mod) {
+  const R = state.rules;
+  if (!R) return "";
+  if (num) {
+    const r = R.rules.find(x => x.id === num);
+    return r ? `Rule ${r.id}: ${r.title}\n${r.summary}` : "";
+  }
+  const m = R.modules.find(x => x.name === mod);
+  return m ? `${words(m.name)}\n${m.summary}` : "";
+}
+function decorateRules(root) {
+  if (!state.rules || !root || root.nodeType !== 1 || root.closest(".rule-ref, textarea, script, style, option")) return;
+  const walk = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode: t => (t.parentElement.closest(".rule-ref, textarea, script, style, option, select") ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT),
+  });
+  const hits = [];
+  for (let t = walk.nextNode(); t; t = walk.nextNode()) { RULE_RX.lastIndex = 0; if (RULE_RX.test(t.data)) hits.push(t); }
+  for (const t of hits) {
+    const frag = document.createDocumentFragment();
+    let last = 0;
+    RULE_RX.lastIndex = 0;
+    for (const m of t.data.matchAll(RULE_RX)) {
+      const tip = ruleTip(m[1], m[2]);
+      if (!tip) continue;
+      frag.append(t.data.slice(last, m.index));
+      const span = document.createElement("span");
+      span.className = "rule-ref"; span.dataset.tip = tip; span.textContent = m[0];
+      frag.append(span);
+      last = m.index + m[0].length;
+    }
+    if (!last) continue;
+    frag.append(t.data.slice(last));
+    t.replaceWith(frag);
+  }
+}
+function mountRuleTips() {
+  new MutationObserver(ms => ms.forEach(m => m.addedNodes.forEach(decorateRules))).observe(document.body, { childList: true, subtree: true });
+  decorateRules(document.body);
+  const tip = document.createElement("div");
+  tip.id = "tip"; tip.hidden = true; document.body.append(tip);
+  document.addEventListener("mouseover", e => {
+    const el = e.target.closest && e.target.closest("[data-tip]");
+    if (!el) { tip.hidden = true; return; }
+    tip.textContent = el.dataset.tip; tip.hidden = false;
+    const r = el.getBoundingClientRect(), w = Math.min(360, window.innerWidth - 16);
+    tip.style.maxWidth = w + "px";
+    tip.style.left = Math.max(8, Math.min(r.left, window.innerWidth - w - 8)) + "px";
+    const below = r.bottom + 6, h = tip.offsetHeight;
+    tip.style.top = (below + h > window.innerHeight ? r.top - h - 6 : below) + "px";
+  });
+  window.addEventListener("scroll", () => (tip.hidden = true), true);
+}
+
+// ------------------------------------------------------------------ settings (the only writes)
+const editKey = () => localStorage.getItem("lfg.editKey") || "";
+async function isUnlocked() {
+  if (!editKey()) return false;
+  try {
+    const r = await fetch("/api/unlocked", { headers: { "X-LFG": "1", "X-LFG-Key": editKey() } });
+    return r.ok && (await r.json()).ok;
+  } catch (e) { return false; }
+}
+async function save(what, body) {
+  try {
+    const r = await fetch(`/api/save/${what}`, { method: "POST", body: JSON.stringify(body),
+      headers: { "X-LFG": "1", "X-LFG-Key": editKey(), "Content-Type": "application/json" } });
+    return await r.json();
+  } catch (e) { return { ok: false, why: e.message }; }
+}
+function saidMsg(el, d, okText) {
+  el.className = "save-msg " + (d.ok ? "ok" : "bad");
+  el.innerHTML = d.ok ? esc(okText || "Saved.") + [].concat(d.notes || [], d.note || []).map(x => " " + fmtWhy(x)).join("") : fmtWhy(d.why || "Not saved.");
+}
+function fieldInput(f, locked) {
+  const id = `cfg-${f.key}`, dis = locked ? "disabled" : "", v = f.value;
+  if (f.type === "bool") return `<input type="checkbox" id="${id}" data-cfg="${esc(f.key)}" ${v ? "checked" : ""} ${dis}>`;
+  if (f.type === "choice") return `<select id="${id}" data-cfg="${esc(f.key)}" ${dis}>${f.options.map(o => `<option ${o === v ? "selected" : ""}>${esc(o)}</option>`).join("")}</select>`;
+  if (f.type === "int") return `<input type="number" id="${id}" data-cfg="${esc(f.key)}" min="${f.min}" max="${f.max}" value="${esc(v)}" ${dis}>`;
+  const val = Array.isArray(v) ? v.join(", ") : v ?? "";
+  return `<input type="text" id="${id}" data-cfg="${esc(f.key)}" value="${esc(val)}" ${dis}>`;
+}
+function settingsGeneral() {
+  const { cfg, unlocked } = state.settings;
+  return `<div>${cfg.fields.map(f => `<label class="set-row" for="cfg-${esc(f.key)}"><div><div class="set-label">${esc(f.label)}</div><div class="set-help">${esc(f.help || "")}</div></div><div class="set-input">${fieldInput(f, !unlocked)}</div></label>`).join("")}</div>
+    <div class="set-actions"><button class="btn primary" id="cfg-save" ${unlocked ? "" : "disabled"}>Save</button><span class="save-msg" id="cfg-msg"></span></div>`;
+}
+function settingsSkills() {
+  const { sk } = state.settings;
+  return `<div class="skill-edit"><nav>${sk.skills.map(x => `<a href="#" data-skill="${esc(x.name)}" title="${esc(x.description)}">/lfg:${esc(x.name)}${x.edited ? '<span class="tag">edited</span>' : ""}</a>`).join("")}</nav>
+    <div class="grow"><div id="skill-editor">${empty("Pick a skill to read or change it", "Your changes survive updates and apply to new Claude Code sessions.")}</div></div></div>`;
+}
+function settingsClaude() {
+  const { cm, unlocked } = state.settings;
+  return `<div class="row"><p class="muted grow">Your own instructions for every Claude Code session (<code>~/.claude/CLAUDE.md</code>). They always win over LFG, and LFG never writes to this file.${cm.has_lfg_section ? " It still has a block an older LFG added: Settings → Claude Code can remove it." : ""}</p>${unlocked ? '<button class="btn" id="cm-edit">Change</button>' : ""}</div>
+    <div id="cm-read" class="box pad md">${md(cm.text)}</div>
+    <div id="cm-write" hidden><p class="muted small">Written in Markdown.</p><textarea class="editor" id="cm-text" spellcheck="false">${esc(cm.text)}</textarea>
+    <div class="set-actions"><button class="btn primary" id="cm-save">Save</button><button class="btn" id="cm-cancel">Cancel</button><span class="save-msg" id="cm-msg"></span></div></div>`;
+}
+function settingsRules() {
+  const R = state.rules || { rules: [], modules: [] }, un = state.settings.unlocked;
+  const rows = R.rules.map(r => `<li><span class="muted nowrap">${esc(r.id)}.</span><div class="grow"><div class="title">${esc(r.title)}</div><div class="meta">${esc(r.summary)}</div></div></li>`).join("");
+  const tag = m => m.yours ? '<span class="tag">yours</span>' : m.edited ? '<span class="tag">edited</span>' : "";
+  return `<div class="set-section" style="margin-top:0"><h4>Guidance agents read</h4>
+    <p class="muted">Agents load these with <code>lfg rule &lt;name&gt;</code>. ${un ? "Change any of them in Markdown, or add your own: every new Claude Code session is told to follow rules you add." : "Unlock editing to change them or add your own."}</p>
+    <div class="skill-edit"><nav>${R.modules.map(m => `<a href="#" data-rule="${esc(m.name)}" title="${esc(m.summary)}">${esc(words(m.name))}${tag(m)}</a>`).join("")}${un ? '<a href="#" data-rule-new class="add">+ Add a rule</a>' : ""}</nav>
+    <div class="grow"><div id="rule-editor">${empty("Pick a rule to read or change it", "Your changes survive updates. A copy is kept every time you save.")}</div></div></div></div>
+    <div class="set-section"><h4>Safety rules</h4><p class="muted">What every LFG session must follow. LFG enforces these in code, so they can't be changed or switched off here.</p>
+    <div class="box"><ul class="list">${rows}</ul></div></div>`;
+}
+async function reloadRules(pick) {
+  state.rules = await api("rules");
+  const body = $("#settings-body");
+  if (body) { body.innerHTML = settingsRules(); wire(body); }
+  if (pick) { $$("[data-rule]").forEach(x => x.classList.toggle("on", x.dataset.rule === pick)); showRule(pick); }
+}
+function wireRules(root) {
+  $$("[data-rule]", root).forEach(a => a.onclick = e => {
+    e.preventDefault();
+    $$("[data-rule], [data-rule-new]", root).forEach(x => x.classList.toggle("on", x === a));
+    showRule(a.dataset.rule);
+  });
+  const nw = $("[data-rule-new]", root);
+  if (nw) nw.onclick = e => {
+    e.preventDefault();
+    $$("[data-rule], [data-rule-new]", root).forEach(x => x.classList.toggle("on", x === nw));
+    newRule();
+  };
+}
+function newRule() {
+  const box = $("#rule-editor");
+  box.innerHTML = `<p><b>Add a rule</b></p><p class="muted small">Give it a short name (lowercase, dashes) and write it in Markdown. Agents read it with <code>lfg rule &lt;name&gt;</code>, and new sessions are told to follow it.</p>
+    <label class="set-label" for="rule-name">Name</label><input type="text" id="rule-name" placeholder="api-style" maxlength="41" style="width:100%;margin:4px 0 12px">
+    <textarea class="editor" id="rule-text" spellcheck="false"># api-style: one line saying what this rule is about
+
+- What to always do
+- What never to do, and why
+</textarea>
+    <div class="set-actions"><button class="btn primary" id="rule-save">Add</button><span class="save-msg" id="rule-msg"></span></div>`;
+  $("#rule-save").onclick = async () => {
+    const name = $("#rule-name").value.trim().toLowerCase();
+    if ((state.rules?.modules || []).some(m => m.name === name) && !confirm(`A rule called "${name}" already exists. Replace its text with this?`)) return;
+    const r = await save("rule", { name, text: $("#rule-text").value });
+    saidMsg($("#rule-msg"), r);
+    if (r.ok) reloadRules(r.saved);
+  };
+}
+function showRule(name) {
+  const box = $("#rule-editor"), un = state.settings.unlocked;
+  const m = (state.rules?.modules || []).find(x => x.name === name);
+  if (!m) { box.innerHTML = empty("Rule not found", ""); return; }
+  const undo = m.yours ? '<button class="btn danger" id="rule-reset">Delete this rule</button>' : m.edited ? '<button class="btn" id="rule-reset">Undo my changes</button>' : "";
+  box.innerHTML = `<div class="row" style="margin-bottom:8px"><b>${esc(words(name))}</b>${m.yours ? '<span class="tag">added by you</span>' : m.edited ? '<span class="tag">edited by you</span>' : ""}<span class="grow"></span>${un ? '<button class="btn" id="rule-edit">Change</button>' : ""}</div>
+    <div id="rule-read"><p class="muted small">Agents read this with <code>lfg rule ${esc(name)}</code>.</p><div class="md">${md(m.text)}</div></div>
+    <div id="rule-write" hidden><p class="muted small">Written in Markdown.</p>
+    <textarea class="editor" id="rule-text" spellcheck="false">${esc(m.text)}</textarea>
+    <div class="set-actions"><button class="btn primary" id="rule-save">Save</button><button class="btn" id="rule-cancel">Cancel</button>${undo}<span class="save-msg" id="rule-msg"></span></div></div>`;
+  const mode = edit => { $("#rule-read").hidden = edit; $("#rule-write").hidden = !edit; if ($("#rule-edit")) $("#rule-edit").hidden = edit; };
+  if ($("#rule-edit")) $("#rule-edit").onclick = () => mode(true);
+  $("#rule-cancel").onclick = () => showRule(name);
+  $("#rule-save").onclick = async () => {
+    const r = await save("rule", { name, text: $("#rule-text").value });
+    saidMsg($("#rule-msg"), r);
+    if (r.ok) reloadRules(name);
+  };
+  const rs = $("#rule-reset");
+  if (rs) rs.onclick = async () => {
+    if (!confirm(m.yours ? `Delete the rule "${name}"? A copy is kept in LFG's backups.` : `Put "${name}" back to how LFG ships it? A copy of your version is kept.`)) return;
+    const r = await save("rule_reset", { name });
+    if (!r.ok) return saidMsg($("#rule-msg"), r);
+    reloadRules(r.deleted ? null : name);
+    if (r.deleted) $("#rule-editor").innerHTML = empty("Rule deleted", "A copy is kept in LFG's backups.");
+  };
+}
+// ------------------------------------------------------------------ settings → Claude Code (LFG's footprint, all undoable)
+function settingsClaudeCode() {
+  return '<div id="cc-box"><div class="loading">Looking at your Claude Code setup…</div></div>';
+}
+let ccTimer = null;
+const where = r => r.root.replace(/^\/Users\/[^/]+/, "~");
+async function loadClaudeCode() {
+  const box = $("#cc-box");
+  if (!box) return;
+  const d = await api("claude"), un = state.settings.unlocked, dis = un ? "" : "disabled";
+  const R = d.repos, hr = d.headroom, sc = d.scan;
+  const repoRows = R.repos.filter(r => r.exists).map(r => `<li>${dot(r.enabled ? "ok" : "")}<div class="grow"><div class="title">${esc(r.name)}</div><div class="meta">${esc(where(r))}${r.hardened ? " · hardened" : ""}${r.headroom ? " · Headroom" : ""}</div></div>
+    ${R.everywhere ? '<span class="muted small">on everywhere</span>' : `<button class="btn small" data-cc="${r.enabled ? "repo_off" : "repo_on"}" data-root="${esc(r.root)}" ${dis}>${r.enabled ? "Turn off" : "Turn on"}</button>`}</li>`).join("");
+  const job = name => {
+    const j = d.jobs[name];
+    return j ? `<div class="meta">${j.status === "running" ? "Installing…" : j.status === "done" ? "Installed." : "Install failed."}</div>${j.log.length ? `<pre class="joblog">${esc(j.log.slice(-12).join("\n"))}</pre>` : ""}` : "";
+  };
+  const packRows = d.packs.map(p => `<li>${dot(p.on ? (p.missing.length ? "warn" : "ok") : "")}<div class="grow"><div class="title">${esc(p.title)}</div><div class="meta">${esc(p.about)}${p.on && p.missing.length ? ` · missing: ${esc(p.missing.map(m => m.split(":")[1]).join(", "))}` : ""}</div>${job(p.name)}</div>
+    ${p.name === "core" ? '<span class="muted small">always on</span>' : p.on && !p.missing.length ? `<button class="btn small" data-cc="pack_remove" data-name="${esc(p.name)}" ${dis}>Turn off</button>` : `<button class="btn small" data-cc="pack_add" data-name="${esc(p.name)}" ${dis || ((d.jobs[p.name] || {}).status === "running" ? "disabled" : "")}>${p.on ? "Install missing" : "Add"}</button>`}</li>`).join("");
+  const hrOpts = [["off", "Off"], ["repos", "Only repos where LFG is on"], ["everywhere", "Every Claude Code session"]];
+  const hrBlocked = hr.cloud_provider ? `Not available: Claude Code uses ${esc(hr.cloud_provider)} here.` : !hr.installed ? "Add the Headroom pack first." : "";
+  const changes = d.changes.length ? `<div class="box"><ul class="list">${d.changes.slice().reverse().map(c => `<li><span class="muted nowrap">#${c.id}</span><div class="grow"><div class="title">${fmtWhy(c.text)}</div><div class="meta">${esc(c.why)} · ${ago(c.ts)}</div></div><button class="btn small" data-cc="change_undo" data-id="${c.id}" ${dis}>Undo</button></li>`).join("")}</ul></div>`
+    : `<div class="box calm">${dot("ok")}LFG has changed nothing outside ~/.lfg.</div>`;
+  const legacy = d.legacy.length ? `<div class="set-section"><h4>Left over from an older LFG</h4><p class="muted">Older versions changed Claude Code for every session. Each fix below removes exactly what LFG added.</p>
+    <div class="box"><ul class="list">${d.legacy.map(l => `<li>${dot("warn")}<div class="grow"><div class="title">${esc(l.title)}</div><div class="meta">${esc(l.fix)}</div></div>${l.default ? `<button class="btn small" data-cc="legacy_fix" data-id="${esc(l.id)}" ${dis}>Fix</button>` : ""}</li>`).join("")}</ul></div></div>` : "";
+  box.innerHTML = `<p class="muted">What LFG does to Claude Code, and where. Everything here is recorded and can be undone; nothing outside the repos you pick is touched.</p>
+    <span class="save-msg" id="cc-msg"></span>${legacy}
+    <div class="set-section"><h4>Where LFG is on</h4><p class="muted">In other repos Claude Code works exactly as if LFG weren't installed: no skills, hooks or MCP servers.</p>
+      <label class="row"><input type="checkbox" data-cc="everywhere" ${R.everywhere ? "checked" : ""} ${dis}> Turn LFG on in every repo <span class="muted small">(not recommended)</span></label>
+      <div class="box mt">${repoRows ? `<ul class="list">${repoRows}</ul>` : empty("No repos yet", "Run <code>lfg enable</code> in a repo, or open one in Claude Code after enabling it.")}</div></div>
+    <div class="set-section"><h4>Feature packs</h4><p class="muted">Core is all LFG needs. The rest install their tools only when you add them. Tools stay installed when you turn a pack off.</p>
+      <div class="box"><ul class="list">${packRows}</ul></div></div>
+    <div class="set-section"><h4>Safety</h4>
+      <div class="box pad"><div class="row">${dot("ok")}<div class="grow"><b>Guard</b><div class="meta">On in every LFG repo: blocks commits, pushes, secret reads and the rest of the 18 rules (Settings → Rules). Recently blocked: ${d.blocked.length ? d.blocked.slice(0, 3).map(b => `rule ${esc(b.rule)} (${esc(b.tool)})`).join(", ") : "nothing"}.</div></div></div>
+      <label class="row mt"><input type="checkbox" data-cc="hardened" ${d.hardened ? "checked" : ""} ${dis}><span><b>Hardened mode</b><span class="meta"> · also add Claude Code deny rules (git commit/push, secret files…) to each LFG repo's <code>.claude/settings.local.json</code>, never to your user settings</span></span></label></div></div>
+    <div class="set-section"><h4>Headroom (context compression)</h4><p class="muted">A local proxy that shrinks what Claude Code sends. ${hr.live ? `Running, forwarding to ${esc(hr.upstream)}.` : "Not running."}</p>
+      <div class="row"><select id="cc-hr" ${dis || (hrBlocked && hr.scope === "off" ? "disabled" : "")}>${hrOpts.map(([v, l]) => `<option value="${v}" ${v === hr.scope ? "selected" : ""}>${esc(l)}</option>`).join("")}</select><button class="btn" data-cc="headroom" ${dis}>Apply</button><span class="muted small">${esc(hrBlocked)}</span></div></div>
+    <div class="set-section"><h4>MCP servers LFG brings</h4><p class="muted">Only in LFG repos. One that isn't set up stays quiet and offers no tools.</p>
+      <div class="box"><ul class="list">${d.mcp.map(m => `<li>${dot(m.ready ? "ok" : "")}<div class="grow"><div class="title">${esc(m.name)}</div><div class="meta">${m.ready ? "ready" : fmtWhy(m.why)}</div></div></li>`).join("")}</ul></div></div>
+    <div class="set-section"><h4>Your Claude Code setup <span class="muted small">(read-only; LFG leaves these alone)</span></h4>
+      <div class="box"><ul class="list">
+        <li><div class="grow"><div class="title">Claude Code ${esc(sc.claude.version || "not found")}</div><div class="meta">${sc.managed_settings ? "Managed by your organisation's policy: " + esc(sc.managed_settings) : "No organisation policy"}${sc.base_url_host ? " · API endpoint " + esc(sc.base_url_host) : ""}</div></div></li>
+        <li><div class="grow"><div class="title">Your hooks</div><div class="meta">${sc.user_hooks.length ? esc(sc.user_hooks.join(", ")) : "none"}</div></div></li>
+        <li><div class="grow"><div class="title">Your MCP servers (every session)</div><div class="meta">${sc.user_mcp_servers.length ? esc(sc.user_mcp_servers.join(", ")) : "none"}</div></div></li>
+        <li><div class="grow"><div class="title">Skills that share a name with LFG's</div><div class="meta">${sc.skill_collisions.length ? sc.skill_collisions.map(x => `<code>/${esc(x)}</code> is yours, LFG's is <code>/lfg:${esc(x)}</code>`).join(" · ") : "none"}</div></div></li>
+      </ul></div></div>
+    <div class="set-section"><h4>Changes LFG made outside ~/.lfg</h4>${changes}
+      <p class="muted small mt">To remove LFG completely, run <code>lfg uninstall</code> in your terminal. It lists everything it will undo before it does anything.</p></div>`;
+  $$("[data-cc]", box).forEach(el => {
+    const act = el.dataset.cc, ev = el.type === "checkbox" ? "onchange" : "onclick";
+    el[ev] = async () => {
+      const body = act === "everywhere" || act === "hardened" ? { on: el.checked } : act === "headroom" ? { scope: $("#cc-hr").value }
+        : { root: el.dataset.root, name: el.dataset.name, id: el.dataset.id };
+      if (act === "repo_off" && !confirm(`Turn LFG off in ${el.dataset.root}? Its graphs and runs are kept.`)) return;
+      if (act === "everywhere" && el.checked && !confirm("Turn LFG on in every repo, including ones you never set up? Each repo can't opt out while this is on.")) { el.checked = false; return; }
+      el.disabled = true;
+      state.ccMsg = await save(act, body);
+      loadClaudeCode();
+    };
+  });
+  if (state.ccMsg) { saidMsg($("#cc-msg", box), state.ccMsg, state.ccMsg.ok ? "Done." : ""); state.ccMsg = null; }
+  clearTimeout(ccTimer);
+  if (Object.values(d.jobs).some(j => j.status === "running")) ccTimer = setTimeout(() => { if (document.body.contains(box)) loadClaudeCode(); }, 2000);
+}
+
+function settingsTools() {
+  return '<div id="tools-box"><div class="loading">Checking…</div></div>';
+}
+// "MCP: ✔ Connected" (raw `claude mcp list` text) -> "Connected"
+const plainDetail = s => (s || "").replace(/MCP:\s*/g, "").replace(/[✔✓✘✗⏸]\uFE0F?\s*/g, "");
+async function loadTools() {
+  const box = $("#tools-box");
+  if (!box) return;
+  const d = await api("tools");
+  const missing = d.tools.filter(t => !t.installed);
+  box.innerHTML = `<p class="muted">Everything LFG connects to, checked ${ago(d.checked_at)}.</p>
+    <div class="box"><ul class="list">${d.integrations.map(i => `<li>${dot(i.ok ? "ok" : i.optional ? "" : "bad")}<div class="grow"><div class="title">${esc(i.name)}</div><div class="meta">${esc(plainDetail(i.detail))}</div></div></li>`).join("")}</ul></div>
+    <div class="set-section"><h4>Command-line tools</h4>${missing.length
+      ? `<div class="box"><ul class="list">${missing.map(t => `<li>${dot(t.required ? "bad" : "")}<div class="grow"><div class="title">${esc(t.tool)} is not installed</div><div class="meta">${esc(t.purpose)}${t.required ? (t.pack === "core" ? " · needed: run lfg setup" : ` · needed by the ${esc(t.pack)} pack: lfg add ${esc(t.pack)}`) : ` · ${esc(t.pack)} pack, not added`}</div></div></li>`).join("")}</ul></div>`
+      : `<div class="box calm">${dot("ok")}All ${n(d.tools.length)} tools are installed.</div>`}</div>`;
+}
+function settingsOllama() {
+  return '<div id="ollama-box"><div class="loading">Asking the local Ollama…</div></div>';
+}
+const gb = v => (v ? `${v} GB` : "—");
+function pullBar(name, p) {
+  const pc = p.total ? Math.round((100 * p.completed) / p.total) : 0;
+  const s = p.error ? `<span class="save-msg bad">${esc(p.error)}</span>` : p.done ? '<span class="save-msg ok">done</span>' : `${esc(p.status)}${p.total ? ` · ${pc}%` : ""}`;
+  return `<div class="pull"><div class="row"><b>${esc(name)}</b><span class="muted small">${s}</span></div>${p.done || p.error ? "" : `<div class="bar"><span style="width:${pc}%"></span></div>`}</div>`;
+}
+let ollamaTimer = null;
+async function loadOllama() {
+  const box = $("#ollama-box");
+  if (!box) return;
+  const d = await api("ollama"), un = state.settings.unlocked, dis = un ? "" : "disabled";
+  const canPull = un && d.running ? "" : "disabled";
+  const pulls = Object.entries(d.pulls || {});
+  const use = name => (name === d.current ? `<span class="st">${dot("ok")}In use</span>` : `<button class="btn" data-ollama-use="${esc(name)}" ${dis}>Use</button>`);
+  box.innerHTML = `<p class="muted">Security tests (<code>/pentest</code>) run on a model on this computer, never in the cloud. ${d.running ? "" : fmtWhy(d.why)}</p>
+    <div class="row">${dot(d.running ? "ok" : "bad")}<span>${d.running ? "Ollama is running" : "Ollama is not running"}</span><span class="muted small">· model in use: ${d.current ? esc(d.current) : "none yet"}${d.ram_gb ? ` · this computer has ${d.ram_gb} GB memory` : ""}</span></div>
+    ${pulls.length ? `<div class="set-section"><h4>Downloading</h4>${pulls.map(([k, p]) => pullBar(k, p)).join("")}</div>` : ""}
+    <div class="set-section"><h4>On this computer</h4><div class="box">${table(d.installed, [
+      { k: "name", label: "Model", html: r => esc(r.name) }, { k: "size_gb", label: "Size", num: true, html: r => gb(r.size_gb) },
+      { k: "use", label: "", html: r => (r.cloud ? '<span class="muted small">cloud model: not allowed</span>' : r.tools ? use(r.name) : '<span class="muted small">can\'t run pentests</span>') },
+    ], { filter: false, emptyTitle: "No models yet", emptyBody: d.running ? "Download one below." : "" })}</div></div>
+    <div class="set-section"><h4>Download a model</h4><div class="box">${table(d.catalog, [
+      { k: "name", label: "Model", html: r => `${esc(r.name)}<div class="sub">${esc(r.note || "")}</div>` },
+      { k: "size_gb", label: "Download", num: true, html: r => gb(r.size_gb) },
+      { k: "fit", label: "Fits this computer", html: r => ({ fits: `${dot("ok")} Yes`, tight: `${dot("warn")} Just`, "too big": `${dot("bad")} No` }[r.fit] || "—") },
+      { k: "act", label: "", html: r => (r.installed ? use(r.name) : `<button class="btn" data-ollama-pull="${esc(r.name)}" ${canPull}>Download</button>`) },
+    ], { filter: false })}</div>
+      <div class="row mt"><input type="text" id="ollama-name" placeholder="Other model, e.g. qwen3:14b" ${dis}><button class="btn" id="ollama-pull" ${canPull}>Download</button><span class="save-msg" id="ollama-msg"></span></div></div>`;
+  mountTables(box);
+  const pull = async name => {
+    const r = await save("ollama_pull", { name });
+    saidMsg($("#ollama-msg"), r, r.ok ? `Downloading ${name}…` : "");
+    if (r.ok) loadOllama();
+  };
+  $$("[data-ollama-pull]", box).forEach(b => b.onclick = () => pull(b.dataset.ollamaPull));
+  $("#ollama-pull", box).onclick = () => pull($("#ollama-name").value.trim());
+  $$("[data-ollama-use]", box).forEach(b => b.onclick = async () => {
+    const r = await save("config", { values: { "pentest.model": b.dataset.ollamaUse } });
+    if (!r.ok) return saidMsg($("#ollama-msg"), r);
+    state.settings.cfg = await api("settings");
+    loadOllama();
+  });
+  clearTimeout(ollamaTimer);
+  if (pulls.some(([, p]) => !p.done)) ollamaTimer = setTimeout(() => { if (document.body.contains(box)) loadOllama(); }, 1500);
+}
+function settingsStorage() {
+  return '<div id="storage-box"><div class="loading">Measuring…</div></div>';
+}
+async function loadStorage() {
+  const box = $("#storage-box");
+  if (!box) return;
+  const d = await api("storage"), un = state.settings.unlocked;
+  const cands = d.candidates.length ? `<div class="box">${table(d.candidates, [
+      { k: "pick", label: "", html: r => `<input type="checkbox" data-clean="${esc(r.id)}" ${un ? "" : "disabled"}>` },
+      { k: "label", label: "What", html: r => `${esc(r.label)}<div class="sub">${esc(r.reason)}</div>` },
+      { k: "mb", label: "Size", num: true, html: r => `${r.mb} MB` }], { filter: false })}</div>
+    <div class="set-actions"><button class="btn danger" id="clean-go" disabled>Delete selected</button><span class="save-msg" id="clean-msg"></span></div>`
+    : `<div class="box calm">${dot("ok")}Nothing to clean up. Everything kept is still in use.</div>`;
+  box.innerHTML = `<p><b>${d.total_mb} MB</b> <span class="muted">used of your ${d.limit_mb} MB limit</span></p>
+    <div class="bar ${d.over ? "over" : ""}"><span style="width:${Math.min(100, pct(d.total_mb, d.limit_mb))}%"></span></div>
+    <p class="muted small">The code maps inside your projects (${d.in_repos_mb || 0} MB) don't count toward this. Git ignores them.</p>
+    <div class="set-section"><h4>Safe to delete</h4>${cands}</div>
+    <div class="set-section"><h4>By project</h4><div class="box">${table(d.repos, [
+      { k: "repo", label: "Project", html: r => esc(repoName(r.repo)) },
+      { k: "total", label: "Size", num: true, sort: r => (r.graphs_mb || 0) + (r.runs_mb || 0), html: r => `${Math.round(((r.graphs_mb || 0) + (r.runs_mb || 0)) * 10) / 10} MB` }], { filter: false })}</div></div>`;
+  mountTables(box);
+  const go = $("#clean-go", box);
+  if (!go) return;
+  const picked = () => $$("[data-clean]", box).filter(c => c.checked).map(c => c.dataset.clean);
+  $$("[data-clean]", box).forEach(c => c.onchange = () => (go.disabled = !picked().length));
+  go.onclick = async () => {
+    const ids = picked();
+    if (!confirm(`Permanently delete ${ids.length} item(s)?`)) return;
+    go.disabled = true;
+    const r = await save("storage_cleanup", { ids });
+    if (!r.ok) { go.disabled = false; return saidMsg($("#clean-msg"), r); }
+    await loadStorage();
+    const msg = $("#clean-msg") || $("#storage-box p");
+    if (msg) saidMsg(msg, r, "Done.");
+    loadBranches();
+  };
+}
+function wireSettings(root) {
+  if ($("#cc-box", root)) loadClaudeCode();
+  if ($("#skills-box", root)) loadSkills();
+  if ($("#ollama-box", root)) loadOllama();
+  if ($("#storage-box", root)) loadStorage();
+  if ($("#tools-box", root)) loadTools();
+  wireRules(root);
+  const cs = $("#cfg-save", root);
+  if (cs) cs.onclick = async () => {
+    const values = {};
+    for (const f of state.settings.cfg.fields) {
+      const el = document.getElementById(`cfg-${f.key}`);
+      let v = f.type === "bool" ? el.checked : f.type === "int" ? Number(el.value) : el.value;
+      if (f.type === "list") v = el.value.split(",").map(x => x.trim()).filter(Boolean);
+      if (JSON.stringify(v) !== JSON.stringify(f.value ?? (f.type === "list" ? [] : ""))) values[f.key] = v;
+    }
+    if (!Object.keys(values).length) return saidMsg($("#cfg-msg"), { ok: true }, "Nothing changed.");
+    const d = await save("config", { values });
+    saidMsg($("#cfg-msg"), d, d.ok ? `Saved ${plural(d.changed.length, "change")}.` : "");
+    if (d.ok) state.settings.cfg = await api("settings");
+  };
+  $$("[data-skill]", root).forEach(a => a.onclick = e => {
+    e.preventDefault();
+    $$("[data-skill]", root).forEach(x => x.classList.toggle("on", x === a));
+    showSkill(a.dataset.skill);
+  });
+  const cmMode = edit => { $("#cm-read").hidden = edit; $("#cm-write").hidden = !edit; $("#cm-edit").hidden = edit; };
+  const ce = $("#cm-edit", root);
+  if (ce) ce.onclick = () => cmMode(true);
+  const cc = $("#cm-cancel", root);
+  if (cc) cc.onclick = () => { $("#cm-text").value = state.settings.cm.text; cmMode(false); };
+  const ms = $("#cm-save", root);
+  if (ms) ms.onclick = async () => {
+    const d = await save("claudemd", { text: $("#cm-text").value });
+    saidMsg($("#cm-msg"), d);
+    if (d.ok) { state.settings.cm = await api("claudemd"); $("#cm-read").innerHTML = md(state.settings.cm.text); }
+  };
+}
+async function showSkill(name) {
+  const box = $("#skill-editor"), un = state.settings.unlocked;
+  const d = await api("skill", { name });
+  if (d.available === false) { box.innerHTML = unavailable(d); return; }
+  const fm = frontMatter(d.text);
+  box.innerHTML = `<div class="row" style="margin-bottom:8px"><b>/lfg:${esc(name)}</b>${d.edited ? '<span class="tag">edited by you</span>' : ""}<span class="grow"></span>${un ? '<button class="btn" id="skill-edit">Change</button>' : ""}</div>
+    <div id="skill-read">${fm.meta.description ? `<p class="muted">${txt(fm.meta.description)}</p>` : ""}<div class="md">${md(fm.body)}</div></div>
+    <div id="skill-write" hidden><p class="muted small">Written in Markdown. Keep the header between the <code>---</code> lines; Claude Code reads it.</p>
+    <textarea class="editor" id="skill-text" spellcheck="false">${esc(d.text)}</textarea>
+    <div class="set-actions"><button class="btn primary" id="skill-save">Save</button><button class="btn" id="skill-cancel">Cancel</button>${d.edited ? '<button class="btn" id="skill-reset">Undo my changes</button>' : ""}<span class="save-msg" id="skill-msg"></span></div></div>`;
+  const mode = edit => { $("#skill-read").hidden = edit; $("#skill-write").hidden = !edit; if ($("#skill-edit")) $("#skill-edit").hidden = edit; };
+  if ($("#skill-edit")) $("#skill-edit").onclick = () => mode(true);
+  $("#skill-cancel").onclick = () => showSkill(name);
+  const refreshList = async () => { state.settings.sk = await api("skills"); const a = $(`[data-skill="${name}"]`); if (a) a.innerHTML = `/lfg:${esc(name)}${state.settings.sk.skills.find(x => x.name === name)?.edited ? '<span class="tag">edited</span>' : ""}`; };
+  $("#skill-save").onclick = async () => {
+    const r = await save("skill", { name, text: $("#skill-text").value });
+    saidMsg($("#skill-msg"), r);
+    if (r.ok) { await refreshList(); showSkill(name); }
+  };
+  const rs = $("#skill-reset");
+  if (rs) rs.onclick = async () => {
+    if (!confirm(`Put /lfg:${name} back to how LFG ships it? A copy of your version is kept.`)) return;
+    const r = await save("skill_reset", { name });
+    if (!r.ok) return saidMsg($("#skill-msg"), r);
+    await refreshList();
+    showSkill(name);
+  };
+}
+
+// ------------------------------------------------------------------ pages
+const NAV = [["home", "Home"], ["runs", "Runs"], ["issues", "Issues"], ["checks", "Checks"], ["code", "Code"], ["docs", "Docs"],
+  ["knowledge", "Knowledge"], ["usage", "Usage"], ["skills", "Skills"], ["settings", "Settings"], ["help", "Help"]];
+const TITLES = Object.fromEntries(NAV);
+const PAGES = {};
+
+async function cachedRuns() {
+  const key = "runs:" + state.repo;
+  if (!state.cache[key]) state.cache[key] = await api("runs");
+  return state.cache[key];
+}
+
+/* What a run is doing, in one line: "Step 5 of 10 · next: run the checks" */
+function runLine(r, stages) {
+  const p = runPlace(stages, r.stages);
+  return p.finished ? "All steps done" : `Step ${p.done} of ${p.total} · next: ${NEXT[p.next]}`;
+}
+/* Things on a run that need a person, as [tone, text] */
+function runAttention(r) {
+  const out = [];
+  if (r.review === "block") out.push(["bad", "The code review found something that must be fixed"]);
+  else if (r.review === "changes") out.push(["warn", "The code review asked for changes"]);
+  if (r.secure === "don't") out.push(["bad", "The security check found problems to fix"]);
+  if (r.ready === "red") out.push(["bad", "Tests or checks are failing"]);
+  if (r.shipcheck === "fail") out.push(["bad", "The ship check failed"]);
+  return out;
+}
+
+PAGES.home = async () => {
+  const d = await api("overview");
+  if (d.available === false) return unavailable(d, "No project yet");
+  const all = await cachedRuns();
+  const stages = all.stages, run = d.run, g = d.graphs || {}, t = d.tokens_7d || {}, hr = d.headroom || {};
+  // what needs the user
+  const attn = [];
+  if (run) runAttention(run).forEach(([tn, text]) => attn.push([tn, text, `#runs/${encodeURIComponent(run.run)}`]));
+  if (d.security && d.security.blocking && !(run && run.secure === "don't")) attn.push(["bad", `The latest security check found ${plural(d.security.blocking, "problem")}`, "#checks"]);
+  if (g.status === "error") attn.push(["bad", "The code map failed to update", "#code"]);
+  (d.integrations || []).filter(x => !x.ok && !x.optional).forEach(x => attn.push(["warn", `${x.name} is not running`, "#settings"]));
+  if (d.work && d.work.blocked) attn.push(["warn", `${plural(d.work.blocked, "issue")} blocked by other work`, "#issues"]);
+  const attnBox = attn.length
+    ? `<div class="box"><ul class="list attn">${attn.map(([tn, text, href]) => `<li>${dot(tn)}<a class="grow" href="${href}">${esc(text)}</a></li>`).join("")}</ul></div>`
+    : `<div class="box calm">${dot("ok")}Nothing needs you right now.</div>`;
+  // the current run
+  let now;
+  if (run) {
+    const p = runPlace(stages, run.stages);
+    now = `<a class="box pad now" href="#runs/${encodeURIComponent(run.run)}" style="display:block;color:inherit;text-decoration:none">
+      <h2>${esc(runName(run))}</h2>
+      ${run.about ? `<p class="about">${txt(run.about)}</p>` : ""}
+      <div class="meta">${run.branch ? `On branch ${esc(run.branch)} · ` : ""}started ${ago(run.created)}${run.tasks.total ? ` · ${run.tasks.done} of ${plural(run.tasks.total, "task")} done` : ""}</div>
+      <div class="progress"><span style="width:${pct(p.done, p.total)}%"></span></div>
+      <div class="small">${p.finished ? "All steps done. The commit message is ready for you." : `Next: ${esc(NEXT[p.next])}`}</div></a>`;
+  } else {
+    now = `<div class="box">${empty("Nothing in progress", "Start in Claude Code with <code>/lfg</code> and a short description of what you want, or <code>/wizard</code> for a guided run.")}</div>`;
+  }
+  const recent = all.runs.filter(r => !run || r.run !== run.run).slice(0, 5);
+  const recentBox = recent.length ? `<div class="box"><ul class="list">${recent.map(r => `<li class="click" data-href="#runs/${encodeURIComponent(r.run)}"><div class="grow"><div class="title">${esc(runName(r))}</div>${r.about ? `<div class="about clamp">${txt(r.about)}</div>` : ""}<div class="meta">${esc(runLine(r, stages))}</div></div><span class="muted small nowrap">${ago(r.created)}</span></li>`).join("")}</ul></div>` : "";
+  const used = (t.input || 0) + (t.output || 0);
+  const saved = hr.available && hr.lifetime && hr.lifetime.tokens_saved;
+  return `${head(run ? "Here's what's happening" : "All quiet", `In <b>${esc(repoName())}</b>${state.branch ? ` on ${esc(state.branch === "-" ? "unrecorded branches" : state.branch)}` : ""}.`)}
+    ${section(run ? "Working on" : "Current work", now)}
+    ${section("Needs your attention", attnBox)}
+    ${recent.length ? section("Earlier runs", recentBox, `<a href="#runs">See all ${n(all.runs.length)}</a>`) : ""}
+    ${section("This week", `<div class="cols">${(d.spend || {}).available ? stat("AI cost", usd(d.spend["7d"]), `${compact(used)} tokens, all projects${saved ? ` · ${compact(saved)} saved by compression` : ""}`) : stat("AI tokens used", compact(used), `across all projects${saved ? ` · ${compact(saved)} saved by compression so far` : ""}`)}${stat("Code map", say(g.status)[0] || "Unknown", `${g.status === "missing" ? "not built yet" : g.synced_at ? `updated ${ago(g.synced_at)}` : ""} ${mapBtn(g.status)}`)}${d.work ? stat("Issues ready to start", n(d.work.ready), d.work.blocked ? `${n(d.work.blocked)} blocked` : "none blocked") : ""}</div>`)}`;
+};
+
+PAGES.runs = async arg => {
+  if (arg) return runDetail(arg);
+  const d = await cachedRuns();
+  if (d.available === false) return unavailable(d);
+  return `${head("Runs", "Each run is one piece of work LFG took from idea to a commit you can review. Click one to see where it is.")}
+    <div class="box">${table(d.runs, [
+      { k: "slug", label: "Work", html: r => `${esc(runName(r))}${r.current ? ' <span class="tag">current</span>' : ""}${r.about ? `<div class="about clamp">${txt(r.about)}</div>` : ""}<div class="sub">${r.branch ? `branch ${esc(r.branch)}` : ""}</div>`, sort: r => runName(r) },
+      { k: "progress", label: "Where it is", html: r => esc(runLine(r, d.stages)), sort: r => r.progress },
+      { k: "attn", label: "Status", html: r => { const a = runAttention(r); return a.length ? `<span class="st">${dot(a[0][0])}${esc(a[0][1])}</span>` : `<span class="st">${dot("ok")}On track</span>`; }, sort: r => runAttention(r).length },
+      { k: "created", label: "Started", html: r => `<span class="nowrap">${ago(r.created)}</span>` },
+    ], { onRow: r => (location.hash = "#runs/" + encodeURIComponent(r.run)), emptyTitle: "No runs yet", emptyBody: "Start one in Claude Code with <code>/lfg</code> and what you want built." })}</div>`;
+};
+
+const FILE_NAMES = { "01-brief.md": "The idea, written up", "02-design.md": "The plan", "tasks.json": "Task list", "04-qa.md": "Test report",
+  "ready.json": "Check results", "05-secure.json": "Security check", "05-pentest.json": "Security test", "06-review.json": "Code review",
+  "07-shipcheck.json": "Ship check", "COMMIT_MSG.md": "Commit message", "PR_BODY.md": "Pull request text", "progress.md": "Progress notes" };
+const fileName = f => FILE_NAMES[f] || (/^03-build-(.+)\.md$/.test(f) ? `Build notes · ${words(f.slice(9, -3))}` : null);
+
+async function runDetail(run) {
+  const [d, all] = await Promise.all([api("run", { run }), cachedRuns()]);
+  if (d.available === false) return unavailable(d);
+  const p = runPlace(all.stages, d.stages), attn = runAttention(d);
+  const steps = `<div class="steps">${all.stages.map(([k]) => `<span class="${d.stages[k] ? "done" : k === p.next ? "next" : ""}">${esc(STEP[k] || k)}</span>`).join("")}</div>`;
+  const files = d.files.filter(f => fileName(f.name)).map(f => ({ ...f, run, label: fileName(f.name) }));
+  const tasks = d.tasks_list.length ? `<div class="box items">${d.tasks_list.map(taskItem).join("")}</div>` : "";
+  const checks = d.checks.length ? `<div class="box items">${readyChecks(d.checks)}</div>` : "";
+  return `${head(runName(d), `${d.branch ? `On branch ${esc(d.branch)} · ` : ""}started ${ago(d.created)}`, '<a class="back" href="#runs">← All runs</a>')}
+    ${d.about ? `<p class="about lead">${txt(d.about)}</p>` : ""}
+    <div class="box pad"><div class="row"><b>${p.finished ? "All steps done" : `Step ${p.done} of ${p.total}`}</b><span class="muted">${p.finished ? "· the commit message is ready for you to review" : `· next: ${esc(NEXT[p.next])}`}</span></div>
+      <div class="progress"><span style="width:${pct(p.done, p.total)}%"></span></div>${steps}</div>
+    ${attn.length ? section("Needs your attention", `<div class="box"><ul class="list">${attn.map(([tn, text]) => `<li>${dot(tn)}<span>${esc(text)}</span></li>`).join("")}</ul></div>`) : ""}
+    ${tasks ? section("Tasks", tasks, `${d.tasks.done} of ${d.tasks.total} done · click one for its steps`) : ""}
+    ${checks ? section("Checks", checks, "click a failed one to see why") : ""}
+    ${files.length ? section("Documents", `<div class="box"><ul class="list">${files.map(f => `<li><a href="#" class="grow" data-run-file='${esc(JSON.stringify([f.run, f.name]))}'>${esc(f.label)}</a><span class="muted small nowrap">${esc(f.mtime)}</span></li>`).join("")}</ul></div>`) : ""}`;
+}
+
+PAGES.issues = async () => {
+  const d = await api("issues");
+  if (d.available === false) return unavailable(d, "Issues aren't available");
+  const ws = d.linear_workspace;
+  const key = r => [r.legacyRef, r.slug].find(v => /^[A-Z][A-Z0-9]+-\d+$/.test(v || ""));
+  const title = r => {
+    const k = key(r), link = k && ws ? ` <a class="small" href="https://linear.app/${encodeURIComponent(ws)}/issue/${encodeURIComponent(k)}" target="_blank" rel="noopener noreferrer">${esc(k)} ↗</a>` : k ? ` <span class="muted small">${esc(k)}</span>` : "";
+    const name = !r.title || !/\s/.test(r.title) ? words(String(r.title || r.slug).replace(/^iss-/, "")) : r.title;  // a bare ID reads as words
+    return `${esc(name)}${link}`;
+  };
+  const bySlug = Object.fromEntries(d.issues.map(i => [i.slug, i]));
+  const fill = rows => rows.map(r => ({ ...bySlug[r.slug], ...r }));
+  const cols = [{ k: "title", label: "Issue", html: title }, { k: "status", label: "Status", html: r => st(r.status) },
+    { k: "updatedAt", label: "Updated", html: r => `<span class="nowrap">${ago(r.updatedAt)}</span>` }];
+  const open = r => openDrawer(r.title || words(r.slug), `<div class="readable"><p>${st(r.status)} <span class="tag">${esc(words(r.issueType || "issue"))}</span></p>
+    ${r.description ? `<div class="md">${md(r.description)}</div>` : '<p class="muted">No description was written for this issue.</p>'}
+    ${r.acceptanceCriteria ? `<h3>Done when</h3><div class="md">${md(r.acceptanceCriteria)}</div>` : ""}</div>`);
+  cols[0].html = r => `${title(r)}${r.description ? `<div class="sub clamp">${esc(r.description)}</div>` : ""}`;
+  const plain = rows => table(fill(rows), cols, { onRow: open });
+  return `${head("Issues", `Your Linear issues, copied in by <code>/inbox</code>. ${n(d.ready.length)} ready to start, ${n(d.blocked.length)} waiting on other work.`)}
+    ${d.error ? `<div class="notice">Couldn't read the issues: ${esc(d.error)}</div>` : ""}
+    ${tabs("issues", [
+      ["ready", "Ready to start", d.ready.length, () => `<div class="box">${plain(d.ready)}</div>`],
+      ["blocked", "Waiting on other work", d.blocked.length, () => `<div class="box">${plain(d.blocked)}</div>`],
+      ["all", "All", d.issues.length, () => `<div class="box">${table(d.issues, cols, { onRow: open, emptyTitle: "No issues yet", emptyBody: "Run <code>/inbox</code> in Claude Code to bring in your Linear issues." })}</div>`],
+    ])}`;
+};
+
+PAGES.checks = async () => {
+  const [r, s] = await Promise.all([api("reviews"), api("security")]);
+  const last = s.secure[0], ship = s.shipcheck[0], rev = r.verdicts[0];
+  const open = r.findings.filter(f => !f.feedback);
+  const sum = `<div class="cols">${stat("Latest code review", rev ? say(rev.verdict)[0] : "None yet", rev ? plural(rev.findings, "finding") : "run <code>/expert</code>")}${stat("Latest security check", last ? say(last.verdict)[0] : "None yet", last ? (last.blocking ? `${plural(last.blocking, "problem")} to fix` : "nothing blocking") : "run <code>/secure</code>")}${stat("Latest ship check", ship ? (ship.pass ? "Passed" : "Failed") : "None yet", ship ? `${ship.ok} of ${ship.total} checks passed` : "")}</div>`;
+  const sevSort = { blocker: 0, critical: 0, high: 1, major: 1, medium: 2, minor: 3, low: 3, nit: 4 };
+  return `${head("Checks", "What the code reviews and security checks found, and the actions LFG stopped to keep your work safe.")}
+    ${sum}
+    <div class="section">${tabs("checks", [
+      ["review", "Review findings", r.findings.length, () => `<div class="box">${table(r.findings, [
+        { k: "severity", label: "How serious", html: x => st(x.severity), sort: x => -(sevSort[String(x.severity).toLowerCase()] ?? 5) },
+        { k: "message", label: "Finding", html: x => `${txt(x.title || x.finding || x.message || x.id)}${x.fix ? `<div class="sub clamp">What to do: ${txt(x.fix)}</div>` : ""}${x.file ? `<div class="sub mono">${esc(x.file)}${x.line ? ":" + esc(x.line) : ""}</div>` : ""}` },
+        { k: "feedback", label: "Your call", html: x => st(x.feedback, "not decided") }], { onRow: x => openDrawer("Review finding", `<div class="readable">${findingCard(x)}</div>`), emptyTitle: "No findings", emptyBody: "Run <code>/expert</code> on a change." })}</div>${open.length ? `<p class="muted small">Record your call with <code>lfg feedback add &lt;id&gt; accept|reject</code>.</p>` : ""}`],
+      ["security", "Security checks", s.secure.length, () => `<div class="box">${table(s.secure, [
+        { k: "verdict", label: "Result", html: x => st(x.verdict) },
+        { k: "blocking", label: "Problems to fix", num: true },
+        { k: "inventory", label: "New things checked", html: x => esc(Object.entries(x.inventory).filter(([, v]) => v).map(([k, v]) => `${v} ${words(k)}`).join(", ") || "none") },
+        { k: "ts", label: "When", html: x => `<span class="nowrap">${ago(x.ts)}</span>` }],
+        { onRow: x => openDrawer("Security check", `<div class="readable"><p>${st(x.verdict)}</p>${x.scope ? `<p class="muted">Checked: ${txt(x.scope)}</p>` : ""}${findingList(x.findings, "No security problems found.")}</div>`) })}</div>`],
+      ["pentest", "Security tests", s.pentest.length, () => `<div class="box">${table(s.pentest, [{ k: "status", label: "Result", html: x => st(x.status) }, { k: "summary", label: "What happened", html: x => `<div class="clamp">${txt(x.summary)}</div>` }, { k: "model", label: "Local model" }],
+        { onRow: x => openDrawer("Security test", `<div class="readable">${JSON_VIEWS["05-pentest.json"](x)}</div>`) })}</div>`],
+      ["ship", "Ship checks", s.shipcheck.length, () => `<div class="box">${table(s.shipcheck, [{ k: "pass", label: "Result", html: x => st(x.pass ? "pass" : "fail") }, { k: "ok", label: "Passed", html: x => `${x.ok} of ${x.total}` }, { k: "failed", label: "What failed", html: x => esc((x.failed || []).map(words).join(", ") || "—") }],
+        { onRow: x => openDrawer("Ship check", `<div class="readable"><p>${st(x.pass ? "pass" : "fail")}</p>${(x.failures || []).length ? shipChecks(x.failures.map(c => ({ ...c, ok: false }))) : '<p class="muted">Every check passed.</p>'}</div>`) })}</div>`],
+      ["stopped", "Stopped actions", r.blocked.length, () => `<p class="muted">Actions an agent tried that break a rule, so LFG stopped them. Nothing here needs you; it shows the guard working.</p><div class="box">${table(r.blocked, [{ k: "why", label: "What was stopped", html: x => esc(x.why || x.tool) }, { k: "rule", label: "Rule", html: x => `rule ${esc(x.rule)}` }, { k: "ts", label: "When", html: x => `<span class="nowrap">${ago(x.ts)}</span>` }])}</div>`],
+    ])}</div>`;
+};
+
+PAGES.code = async () => {
+  const [c, a] = await Promise.all([api("code"), api("architecture")]);
+  const g = await api("graphs");
+  const [gText, gTone] = say(g.status);
+  const mapRow = `<div class="box pad row">${dot(gTone)}<div class="grow"><b>Code map: ${esc((gText || "unknown").toLowerCase())}</b><div class="meta">${g.status === "syncing" ? "Building in the background. This page updates when it's done." : g.synced_at ? `Updated ${ago(g.synced_at)}${g.seconds ? ` in ${Math.round(g.seconds)}s` : ""}.` : "Not built yet."}${g.error ? ` Last error: ${esc(String(g.error).slice(0, 200))}` : ""}</div></div>
+    ${mapBtn(g.status)}${g.status !== "missing" && g.status !== "syncing" ? '<button class="btn small" data-map-build="rebuild">Rebuild from scratch</button><button class="btn small" data-map-build="docs" title="Wikis, call flows and playbooks">Refresh docs</button>' : ""}</div>`;
+  if (c.available === false && a.available === false) return `${head("Code", "LFG keeps a map of this project so agents read only the parts that matter.")}${mapRow}
+    ${g.status === "syncing" ? "" : empty("No code map yet", "Build it now. It runs in the background on this computer and usually takes a minute or two.")}`;
+  let summary = "";
+  if (c.available !== false) {
+    const cov = pct(c.coverage.tested, c.coverage.tested + c.coverage.untested);
+    summary = `${n(c.nodes.File)} files and ${n((c.nodes.Function || 0) + (c.nodes.Class || 0))} functions and classes. ${cov}% of them have a test.`;
+  }
+  const risky = c.available !== false ? (c.hotspots || []).slice(0, 10) : [];
+  const areas = a.available !== false ? a.community_list.slice(0, 12) : [];
+  const notes = a.available !== false ? a.rationale : [];
+  return `${head("Code", `LFG keeps a map of this project so agents read only the parts that matter. ${summary}`)}
+    ${mapRow}
+    ${risky.length ? section("Where changes are riskiest", `<div class="box">${table(risky, [
+      { k: "symbol", label: "Code", html: r => `${esc(r.symbol)}<div class="sub">${esc(r.file)}</div>` },
+      { k: "callers", label: "Used by", num: true, html: r => plural(r.callers, "place") },
+      { k: "coverage", label: "Tested", html: r => (r.coverage === "tested" ? `${dot("ok")} Yes` : `${dot("warn")} No`) }], { filter: false })}</div>`, "used in many places, so a change here reaches far") : ""}
+    ${areas.length ? section("Main parts of the code", `<div class="box"><ul class="list">${areas.map(x => `<li><div class="grow"><div class="title">${esc(x.name)}</div><div class="meta">${esc((x.files || []).slice(0, 3).join(" · "))}</div></div></li>`).join("")}</ul></div>`) : ""}
+    ${notes.length ? section("Notes left in the code", `<div class="box">${table(notes, [{ k: "note", label: "Note" }, { k: "file", label: "Where", html: r => `<span class="small muted">${esc(r.file + (r.line ? ":" + r.line : ""))}</span>` }])}</div>`, "WHY, NOTE and HACK comments") : ""}
+    ${section("Explore", `<div class="row"><button class="btn" data-view="architecture" data-target="explore">Map of the code</button><button class="btn" data-view="callflow" data-target="explore">How calls flow</button><button class="btn" data-view="code" data-target="explore">Detailed code graph</button><button class="btn" data-view="health" data-target="explore">Health report</button></div><div id="explore"></div>`)}`;
+};
+
+const DOC_SHOWN = 12;
+PAGES.docs = async arg => {
+  const d = await api("docs");
+  if (d.available === false) return unavailable(d);
+  const parts = (arg || "").split("/");
+  let src = parts[0], path = decodeURIComponent(parts.slice(1).join("/"));
+  const first = d.groups.find(g => g.items.length);
+  if (!src && first) { src = first.id; path = first.items[0].path; }
+  const nav = d.groups.filter(g => g.items.length).map(g => `<div class="grp"><span>${esc(g.title)}</span><span>${g.items.length}</span></div>
+    <div data-grp="${esc(g.id)}">${g.items.map((it, i) => `<a href="#docs/${esc(g.id)}/${encodeURIComponent(it.path)}" class="${g.id === src && it.path === path ? "on" : ""}${i >= DOC_SHOWN && !(g.id === src && it.path === path) ? " extra" : ""}" title="${esc(it.title)}">${esc(it.title)}</a>`).join("")}${g.items.length > DOC_SHOWN ? `<a href="#" class="more" data-doc-more>Show all ${g.items.length}</a>` : ""}</div>`).join("");
+  let body = empty("No docs yet", "LFG writes them from the code map automatically. They'll appear after the next update.");
+  if (src && path) {
+    const doc = await api("doc", { src, path });
+    body = doc.text === "not found" ? empty("Document not found", "") : `<div class="md">${md(doc.text, true)}</div>`;
+  }
+  return `${head("Docs", "Guides and runbooks written from the code, kept up to date as it changes.")}
+    <div class="docs"><div class="box doc-nav"><div class="table-tools"><input type="search" id="doc-filter" placeholder="Search docs…"></div>${nav}</div>
+    <div class="box" id="doc-body" data-src="${esc(src || "")}" data-path="${esc(path || "")}">${body}</div></div>`;
+};
+
+PAGES.knowledge = async () => {
+  const [k, b] = await Promise.all([api("knowledge"), api("brain")]);
+  if (k.available === false && b.available === false) return unavailable(k, "Knowledge isn't available");
+  const K = k.available === false ? { decisions: [], principles: [], invariants: [], unheld: [], gaps: [], learnings: [] } : k;
+  const B = b.available === false ? { notes: [], preferences: [] } : b;
+  const unheld = new Set((K.unheld || []).map(r => r.slug));
+  const listOf = (rows, fn) => `<div class="box"><ul class="list">${rows.map(fn).join("")}</ul></div>`;
+  const rules = K.principles.map(p => ({ text: p.statement, why: p.rationale, s: p.status, kind: p.polarity === "forbids" ? "Never" : "Always" }))
+    .concat(K.invariants.map(i => ({ text: i.statement, s: unheld.has(i.slug) ? "unheld" : i.status, kind: "Must stay true" })));
+  return `${head("Knowledge", "What LFG remembers between sessions: decisions and lessons about this project, and your own preferences. Agents read these before they work.")}
+    ${tabs("know", [
+      ["dec", "Decisions", K.decisions.length, () => listOf(K.decisions, r => `<li><div class="grow"><div class="title">${esc(r.title)}</div><div class="meta">${esc(r.decision)}</div></div><span class="muted small nowrap">${ago(r.createdAt)}</span></li>`)],
+      ["lrn", "Lessons learned", K.learnings.length, () => listOf(K.learnings, r => `<li><div class="grow"><div class="title">${esc(r.title)}</div><div class="meta">${esc((r.body || "").slice(0, 280))}</div></div><span class="muted small nowrap">${ago(r.createdAt)}</span></li>`)],
+      ["rules", "Code rules", rules.length, () => listOf(rules, r => `<li><span class="tag">${esc(r.kind)}</span><div class="grow"><div class="title">${esc(r.text)}</div>${r.why ? `<div class="meta">${esc(r.why)}</div>` : ""}</div>${st(r.s)}</li>`)],
+      ["gaps", "Known gaps", K.gaps.length, () => listOf(K.gaps, r => `<li><div class="grow"><div class="title">${esc(r.title)}</div><div class="meta">${r.currentBehavior ? `Today: ${esc(r.currentBehavior)}` : ""}${r.targetBehavior ? ` · Goal: ${esc(r.targetBehavior)}` : ""}</div></div>${st(r.state)}</li>`)],
+      ["pref", "Your preferences", B.preferences.length, () => listOf(B.preferences, r => `<li><div class="grow"><div class="title">${esc(r.name || words(r.slug))}</div>${r.content ? `<div class="meta">${esc(String(r.content).slice(0, 280))}</div>` : ""}</div></li>`)],
+      ["notes", "Your notes", B.notes.length, () => listOf(B.notes, r => `<li><div class="grow"><div class="title">${esc(r.name || words(r.slug))}</div>${r.content ? `<div class="meta">${esc(String(r.content).slice(0, 280))}</div>` : ""}</div><span class="muted small nowrap">${esc(words(r.kind))}</span></li>`)],
+    ])}
+    <p class="muted small mt">To add something, tell Claude Code what to remember, or use <code>/note</code>.</p>`;
+};
+
+PAGES.usage = async () => {
+  const d = await api("usage");
+  const t = (d.days || []).reduce((a, x) => { for (const k of ["input", "output", "cache_read", "cache_write"]) a[k] += x[k] || 0; return a; }, { input: 0, output: 0, cache_read: 0, cache_write: 0 });
+  const hit = pct(t.cache_read, t.cache_read + t.input + t.cache_write);
+  const hr = d.headroom || {}, life = hr.lifetime || {}, sp = d.spend || {};
+  return `${head("Usage", "What Claude Code used and cost, across all your projects, over the last 30 days.")}
+    ${sp.available ? `<div class="cols">${stat("Spent today", usd(sp.today))}${stat("Last 7 days", usd(sp["7d"]))}${stat("Last 30 days", usd(sp["30d"]), "at API prices, worked out by tokensave from Claude Code's logs")}</div>`
+      : sp.pending ? `<p class="muted small" data-spend-pending>Working out costs…</p>` : `<p class="muted small">Cost isn't shown: ${fmtWhy(sp.why || "not available")}.</p>`}
+    <div class="cols">${stat("Tokens sent", compact(t.input + t.cache_read + t.cache_write), `${hit}% reused from cache, which costs less`)}${stat("Tokens written", compact(t.output), "the AI's replies")}${stat("Saved by compression", hr.available && life.calls ? compact(life.tokens_saved) : "—", hr.available && life.calls ? `${life.savings_percent || 0}% smaller before sending${life.cost_usd ? ` · about ${usd(life.cost_usd)} saved, by Headroom's count` : ""}` : hr.pending ? `<span data-spend-pending>checking…</span>` : "not active yet")}</div>
+    ${section("Per day", `<div class="box pad">${barChart((d.days || []).map(x => ({ label: x.day, values: [(x.input || 0) + (x.cache_write || 0), x.output] })), [["Sent (not cached)", "var(--chart-1)"], ["Written", "var(--chart-2)"]])}</div>`)}
+    ${(d.models || []).length ? section("By model", `<div class="box">${table(d.models, [{ k: "model", label: "Model" }, { k: "input", label: "Sent", num: true, html: r => compact((r.input || 0) + (r.cache_read || 0)) }, { k: "output", label: "Written", num: true, html: r => compact(r.output) }], { filter: false })}</div>`) : ""}
+    ${sp.available && (sp.models || []).length ? section("Cost by model, last 30 days", `<div class="box">${table(sp.models, [{ k: "model", label: "Model" }, { k: "usd", label: "Cost", num: true, html: r => usd(r.usd) }], { filter: false })}</div>`) : ""}`;
+};
+
+PAGES.settings = async () => {
+  const [cfg, sk, cm, unlocked] = await Promise.all([api("settings"), api("skills"), api("claudemd"), isUnlocked()]);
+  state.settings = { cfg, sk, cm, unlocked };
+  return `${head("Settings", unlocked ? "Changes are checked, refused if they look like a password or key, and backed up." : "")}
+    ${unlocked ? "" : `<div class="notice">Read-only. To make changes, run <code>lfg ui</code> in your own terminal; it opens this page unlocked.</div>`}
+    <div class="section">${tabs("settings", [["claudecode", "Claude Code", null, settingsClaudeCode], ["general", "General", null, settingsGeneral], ["tools", "Connections", null, settingsTools], ["ollama", "Local AI models", null, settingsOllama], ["storage", "Disk space", null, settingsStorage], ["rules", "Rules", null, settingsRules], ["claudemd", "Your instructions", null, settingsClaude]])}</div>`;
+};
+
+// ------------------------------------------------------------------ skills: every skill Claude Code loads, from every source
+const SRC_LABEL = { personal: "Yours", "personal command": "Your command", project: "This project", plugin: "Plugin" };
+PAGES.skills = async () => {
+  const [sk, cm, unlocked] = await Promise.all([api("skills"), api("claudemd"), isUnlocked()]);
+  state.settings = Object.assign(state.settings || {}, { sk, cm, unlocked, cfg: (state.settings || {}).cfg });
+  return `${head("Skills", "Everything Claude Code can load as a skill on this computer: yours, this project's and every plugin's, LFG's included.")}
+    ${unlocked ? "" : `<div class="notice">Read-only. To change skills, run <code>lfg ui</code> in your own terminal; it opens this page unlocked.</div>`}
+    <div class="section">${tabs("skillspage", [["all", "All skills", null, () => '<div id="skills-box"><div class="loading">Reading skills…</div></div>'], ["lfgedit", "Edit LFG skills", null, settingsSkills]])}</div>`;
+};
+async function loadSkills() {
+  const box = $("#skills-box");
+  if (!box) return;
+  const d = await api("allskills"), un = state.settings.unlocked, S = d.summary;
+  const filt = sessionStorage.getItem("lfg.skills.filter") || "all";
+  const rows = d.skills.filter(r => filt === "all" || (filt === "collisions" ? r.collides_with.length : filt === "auto" ? r.auto : r.source === filt));
+  box.innerHTML = `<div class="cols">${stat("Skills", n(S.total))}${stat("Claude may use on its own", n(S.auto), `about ${compact(S.approx_tokens)} tokens of descriptions in every session`)}${stat("Name clashes", n(S.collisions), "the short name goes to your own skill first")}</div>
+    <div class="row mt"><label class="muted small" for="sk-filter">Show</label><select id="sk-filter">${[["all", "All"], ["auto", "Used on its own"], ["collisions", "Name clashes"], ...S.sources.map(x => [x, SRC_LABEL[x] || x])].map(([v, l]) => `<option value="${esc(v)}" ${v === filt ? "selected" : ""}>${esc(l)}</option>`).join("")}</select><span class="save-msg" id="sk-msg"></span></div>
+    <div class="box mt">${table(rows, [
+      { k: "invoke", label: "Type", html: r => `<code class="nowrap">${esc(r.invoke)}</code>${r.shadowed ? ' <span class="tag" title="A skill of yours has the same short name">use full name</span>' : ""}` },
+      { k: "source", label: "From", html: r => `${esc(SRC_LABEL[r.source] || r.source)}${r.plugin ? `<div class="sub">${esc(r.plugin)}${r.enabled === false ? " · off" : ""}</div>` : ""}` },
+      { k: "auto", label: "Claude uses it on its own", sort: r => (r.auto ? 1 : 0), html: r => r.editable ? `<label class="row"><input type="checkbox" data-sk-auto="${esc(r.id)}" ${r.auto ? "checked" : ""} ${un ? "" : "disabled"}> ${r.auto ? "yes" : "only when typed"}</label>` : (r.auto ? "yes" : "only when typed") },
+      { k: "description", label: "What it does", html: r => `<span title="${esc(r.description)}">${esc(r.description.slice(0, 140))}${r.description.length > 140 ? "…" : ""}</span>${r.collides_with.length ? `<div class="sub">same name as ${r.collides_with.map(x => `<code>${esc(x)}</code>`).join(", ")}</div>` : ""}` },
+      { k: "chars", label: "Size", num: true },
+    ], { onRow: r => showSkillText(r.id), emptyTitle: "No skills here" })}</div>`;
+  mountTables(box);
+  $("#sk-filter", box).onchange = e => { sessionStorage.setItem("lfg.skills.filter", e.target.value); loadSkills(); };
+  $$("[data-sk-auto]", box).forEach(c => {
+    c.onclick = e => e.stopPropagation();
+    c.onchange = async () => {
+      const r = await save("skill_auto", { id: c.dataset.skAuto, auto: c.checked });
+      saidMsg($("#sk-msg"), r, r.ok ? "Saved." : "");
+      if (!r.ok) c.checked = !c.checked;
+    };
+  });
+}
+async function showSkillText(id) {
+  const d = await api("skilltext", { id });
+  if (d.available === false) return;
+  const fm = frontMatter(d.text);
+  openDrawer(d.invoke, `${fm.meta.description ? `<p class="muted">${txt(fm.meta.description)}</p>` : ""}${d.lfg_name ? '<p class="small">Change it under <b>Edit LFG skills</b>.</p>' : ""}<div class="md">${md(fm.body)}</div>`);
+};
+
+PAGES.help = async () => {
+  const d = await api("guide");
+  return `${head("Help", `New here? Type <code>/wizard</code> in Claude Code for a guided run, or <code>/which</code> if you're not sure what to do next. LFG ${esc(d.version)}.`)}
+    ${tabs("help", [
+      ["guide", "Guide", null, () => d.has_guide ? `<iframe class="viewer" src="/guide/guide.html" title="LFG guide" referrerpolicy="no-referrer"></iframe>` : empty("The guide isn't installed", "Re-run <code>bootstrap.sh</code>.")],
+      ["skills", "What you can ask for", d.skills.length, () => `<div class="box">${table(d.skills, [{ k: "name", label: "Command", html: r => `<code>/${esc(r.name)}</code>` }, { k: "description", label: "What it does" }])}</div>`],
+    ])}`;
+};
+
+// ------------------------------------------------------------------ shell
+const NAV_GROUPS = [["Your work", ["home", "runs", "issues", "checks"]], ["This project", ["code", "docs", "knowledge"]], ["LFG", ["usage", "skills", "settings", "help"]]];
+function renderNav(active) {
+  $("#nav").innerHTML = NAV_GROUPS.map(([g, ks]) => `<div class="nav-grp">${esc(g)}</div>${ks.map(k => `<a class="${k === active ? "on" : ""}" href="#${k}">${esc(TITLES[k])}</a>`).join("")}`).join("");
+}
+/* code map: build/update from the dashboard (the same background job the hooks start) */
+const mapBtn = (st, cls = "btn small") => st === "syncing" ? "" : st === "missing" ? `<button class="${cls} primary" data-map-build="update">Build now</button>`
+  : st === "fresh" ? `<button class="${cls}" data-map-build="update" title="Re-check the code for changes">Refresh</button>` : `<button class="${cls}" data-map-build="update">Update now</button>`;
+let mapTimer = null, mapWatching = false;
+async function buildMap(what, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = "Starting…"; }
+  const r = await save("graphs_build", { repo: state.repo, what });
+  if (!r.ok) { if (btn) { btn.disabled = false; btn.textContent = "Try again"; btn.title = r.why || ""; } alert(r.why || "Couldn't start it."); return; }
+  if (what === "docs") { if (btn) btn.textContent = "Started: docs update in the background"; return; }
+  mapWatching = true;
+  setTimeout(mapStatus, 1500);
+}
+function wireMap(root) {
+  $$("[data-map-build]", root).forEach(b => b.onclick = e => {
+    e.preventDefault();
+    if (b.dataset.mapBuild === "rebuild" && !confirm("Rebuild the code map from scratch? It runs in the background and can take a few minutes on a big project.")) return;
+    buildMap(b.dataset.mapBuild, b);
+  });
+}
+async function mapStatus() {
+  const el = $("#map-status");
+  clearTimeout(mapTimer);
+  if (!state.repo) { el.innerHTML = ""; return; }
+  try {
+    const g = await api("graphs");
+    const [text, t] = say(g.status);
+    el.innerHTML = `<span class="map-line">${dot(t)}<span class="label">Code map: ${esc((text || "unknown").toLowerCase())}</span></span>${mapBtn(g.status, "btn tiny")}`;
+    el.title = `Code map: ${(text || "unknown").toLowerCase()}. Agents read this map instead of whole files.`;
+    wireMap(el);
+    if (g.status === "syncing") { mapWatching = true; mapTimer = setTimeout(mapStatus, 4000); }
+    else if (mapWatching) {
+      mapWatching = false;
+      if (["home", "code"].includes((location.hash.slice(1) || "home").split("/")[0])) { state.cache = {}; route(); }
+    }
+  } catch (e) { el.innerHTML = ""; }
+}
+let renderSeq = 0;
+async function route() {
+  let [page, ...rest] = (location.hash.slice(1) || "home").split("/");
+  page = { overview: "home", reviews: "checks", security: "checks", architecture: "code", health: "code", brain: "knowledge", tools: "settings" }[page] || page;
+  const key = PAGES[page] ? page : "home";
+  const arg = rest.join("/");
+  renderNav(key);
+  document.title = `${TITLES[key]} · LFG`;
+  const seq = ++renderSeq, view = $("#view");
+  view.innerHTML = '<div class="skeleton" style="height:60px;width:40%"></div><div class="skeleton mt"></div><div class="skeleton mt" style="height:220px"></div>';
+  let html;
+  try { html = await PAGES[key](decodeURIComponent(arg)); } catch (e) { html = unavailable({ why: "Couldn't load this page: " + e.message }); }
+  if (seq !== renderSeq) return;
+  view.innerHTML = html;
+  mountTables(view); mountTabs(view); wire(view);
+  $$("[data-href]", view).forEach(li => li.onclick = () => (location.hash = li.dataset.href));
+  if (key === "docs") wireDocs();
+  if (!arg) window.scrollTo(0, 0);
+}
+function wireDocs() {
+  const body = $("#doc-body");
+  $$("[data-doclink]", body).forEach(a => a.onclick = e => {
+    e.preventDefault();
+    const base = body.dataset.path.split("/").slice(0, -1);
+    const target = a.dataset.doclink.split("#")[0];
+    const parts = [...base];
+    for (const p of target.split("/")) { if (p === "..") parts.pop(); else if (p && p !== ".") parts.push(p); }
+    location.hash = `#docs/${body.dataset.src}/${encodeURIComponent(parts.join("/"))}`;
+  });
+  const f = $("#doc-filter");
+  if (f) f.oninput = () => { const q = f.value.toLowerCase(); $(".doc-nav").classList.toggle("searching", !!q); $$(".doc-nav a:not(.more)").forEach(a => (a.style.display = !q || a.textContent.toLowerCase().includes(q) ? "" : "none")); };
+  $$("[data-doc-more]").forEach(m => m.onclick = e => { e.preventDefault(); m.parentNode.classList.add("all"); });
+  const on = $(".doc-nav a.on");
+  if (on) on.scrollIntoView({ block: "nearest" });
+}
+async function init() {
+  if (location.hash.startsWith("#unlock=")) {  // from `lfg ui`: keep the edit key, drop it from the URL
+    localStorage.setItem("lfg.editKey", decodeURIComponent(location.hash.slice(8)));
+    history.replaceState(null, "", location.pathname);
+  }
+  $("#drawer-close").onclick = closeDrawer;
+  $("#drawer").onclick = e => { if (e.target.id === "drawer") closeDrawer(); };
+  document.addEventListener("keydown", e => { if (e.key === "Escape") closeDrawer(); });
+  try { state.rules = await api("rules"); } catch (e) { state.rules = null; }
+  mountRuleTips();
+  const r = await api("repos");
+  state.repos = r.repos || [];
+  if (!state.repos.some(x => x.id === state.repo)) state.repo = state.repos[0] ? state.repos[0].id : "";
+  $("#repo").innerHTML = state.repos.map(x => `<option value="${esc(x.id)}" title="${esc(x.root || x.id)}" ${x.id === state.repo ? "selected" : ""}>${esc(x.name || x.id)}</option>`).join("") || "<option>no projects yet</option>";
+  $("#repo").onchange = async () => { state.repo = $("#repo").value; localStorage.setItem("lfg.repo", state.repo); await loadBranches(); refresh(); };
+  $("#branch").onchange = () => { state.branch = $("#branch").value; localStorage.setItem(branchPref(), state.branch); refresh(); };
+  window.onhashchange = route;
+  await loadBranches();
+  mapStatus();
+  route();
+}
+async function loadBranches() {
+  /* runs and checks are tagged with the branch they ran on; the code map is one per project */
+  const sel = $("#branch");
+  let B = null;
+  try { B = state.repo ? await api("branches", { branch: "" }) : null; } catch (e) { B = null; }
+  B = B || { branches: [], unrecorded: 0 };
+  const known = new Set(B.branches.map(b => b.name).concat(B.unrecorded ? ["-"] : []));
+  state.branch = localStorage.getItem(branchPref()) || "";
+  if (!known.has(state.branch)) state.branch = "";
+  const opt = (v, label) => `<option value="${esc(v)}" ${v === state.branch ? "selected" : ""}>${esc(label)}</option>`;
+  sel.innerHTML = opt("", "All branches") + B.branches.map(b => opt(b.name, b.name + (b.state === "current" ? " (checked out)" : b.state === "deleted" ? " (deleted)" : ""))).join("") + (B.unrecorded ? opt("-", "Older runs (branch unknown)") : "");
+  sel.disabled = !state.repo;
+  sel.hidden = !B.branches.length && !B.unrecorded;
+  sel.title = "Show runs and checks from one branch. The code map always follows the checked-out branch.";
+}
+function refresh() { state.cache = {}; mapStatus(); route(); }
+init();

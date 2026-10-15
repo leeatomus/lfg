@@ -1,0 +1,15 @@
+// LFG queries for second-brain · author Varun Singh
+// Keyword search (bm25) runs inside the local Omnigraph server: no API key, no network.
+// Pass the full text of the query you need to the MCP `query` / `mutate` tool, with its name and params.
+
+query find_notes($q: String) {
+    match { $n: Note }
+    return { $n.slug, $n.name, $n.kind, $n.content, $n.tags }
+    order { bm25($n.name, $q) }
+    limit 5
+}
+
+// The cookbook's add_note stores no text; this one keeps the content, date and tags.
+query save_note($slug: String, $name: String, $kind: String, $content: String, $when: Date, $tags: [String], $now: DateTime) {
+    insert Note { slug: $slug, name: $name, kind: $kind, content: $content, when: $when, tags: $tags, createdAt: $now, updatedAt: $now }
+}

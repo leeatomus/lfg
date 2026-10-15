@@ -1,0 +1,366 @@
+"""`lfg ui`: the LFG dashboard on 127.0.0.1.
+
+One place for everything LFG knows about a repo: runs, the Linear mirror, reviews, security, both code
+graphs, generated docs/playbooks, dev-graph, second-brain, token usage (incl. Headroom), tool health, the Claude Code
+settings that matter for LFG and every skill Claude Code loads (control.py).
+Data comes from dash.py; the page is ui_assets/ (no external resources). Serves files only from ~/.lfg,
+never from the repo, never secrets. Everything is read-only except the Settings page (config.json, LFG
+skills, global CLAUDE.md, see settings.py): those POSTs need the local edit key that `lfg ui` gives the
+browser, a same-origin request and JSON. Author: Varun Singh.
+"""
+import glob
+import html
+import http.server
+import json
+import os
+import threading
+import urllib.parse
+import webbrowser
+
+from . import common as C
+from . import dash
+from . import settings as S
+
+ASSETS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui_assets")
+ASSET_TYPES = {"html": "text/html", "js": "text/javascript", "css": "text/css", "svg": "image/svg+xml"}
+
+# The dashboard itself loads nothing from outside 127.0.0.1.
+PAGE_CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+            "connect-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; "
+            "frame-ancestors 'none'")
+# Tool-generated views (graphify graph/call-flow, code-review-graph graph) pull their chart libraries from
+# these CDNs. They may load scripts from there, but cannot send data anywhere: no fetch/XHR/beacons, no
+# images from other hosts, no forms, and they only render inside the dashboard.
+STATIC_CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://unpkg.com "
+              "https://cdn.jsdelivr.net https://d3js.org; style-src 'self' 'unsafe-inline' https://unpkg.com "
+              "https://cdn.jsdelivr.net; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; "
+              "object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'")
+
+
+def _rid(q):
+    s = (q.get("repo") or [""])[0]
+    return s if s and "/" not in s and ".." not in s and not s.startswith(".") else None
+
+
+def _arg(q, k):
+    return (q.get(k) or [""])[0]
+
+
+def graph_view(rid, kind):
+    """URL of a tool-generated interactive view, generating it on first request. Graph views live in the repo's
+    graph data (served by /graphdata/), the health report under ~/.lfg (served by /static/)."""
+    from . import graphs as G
+    root = dash.repo_root(rid)
+    crg, gout = G.data_dir(rid, "crg") or "", G.data_dir(rid, "graphify") or ""
+    if kind == "code":
+        cands = glob.glob(os.path.join(crg, "*.html")) if crg else []
+        if crg and not cands and root and C.which("code-review-graph"):
+            C.run(["code-review-graph", "visualize", "--repo", root, "--data-dir", crg],
+                  cwd=root, timeout=600, env={"CRG_DATA_DIR": crg})
+            cands = glob.glob(os.path.join(crg, "*.html"))
+    elif kind == "architecture":
+        cands = glob.glob(os.path.join(gout, "graph.html")) if gout else []
+        gj = os.path.join(gout, "graph.json")
+        if gout and not cands and os.path.exists(gj) and C.which("graphify"):
+            C.run(["graphify", "export", "html", "--graph", gj], cwd=gout, timeout=600,
+                  env={"GRAPHIFY_OUT": gout, "GRAPHIFY_NO_AUTO_REFRESH": "1"})
+            cands = glob.glob(os.path.join(gout, "graph.html"))
+    elif kind == "callflow":
+        cands = glob.glob(os.path.join(gout, "callflow.html")) if gout else []
+    elif kind == "health":
+        cands = glob.glob(C.lfg_path("ui", "static", "arch-health", "%s.html" % rid))
+    else:
+        cands = []
+    if not cands:
+        return {"message": {"code": "No code graph view yet. Run `lfg graphs ensure` in the repo.",
+                            "architecture": "No architecture graph yet. Run `lfg graphs ensure` in the repo.",
+                            "callflow": "No call-flow view yet. Run `lfg graphs docs` in the repo.",
+                            "health": "No architecture-health report yet. Run /health in the repo."}.get(kind, "?")}
+    p = cands[0]
+    if kind == "health":
+        return {"src": "/static/" + urllib.parse.quote(os.path.relpath(p, C.LFG_HOME)), "size": os.path.getsize(p)}
+    sub = "crg" if kind == "code" else "graphify"
+    return {"src": "/graphdata/%s/%s/%s" % (urllib.parse.quote(rid), sub, urllib.parse.quote(os.path.basename(p))),
+            "size": os.path.getsize(p)}
+
+
+def api(view, q):
+    if view == "repos":
+        return dash.repos()
+    if view == "tools":
+        return dash.tools()
+    if view == "issues":
+        return dash.issues()
+    if view == "knowledge":
+        return dash.knowledge()
+    if view == "brain":
+        return dash.brain()
+    if view == "guide":
+        return dash.guide()
+    if view == "guide_doc":
+        return dash.guide_doc(_arg(q, "id"))
+    if view == "settings":
+        return S.config_view()
+    if view == "skills":
+        return S.skills()
+    if view == "skill":
+        try:
+            return S.skill(_arg(q, "name"))
+        except S.Invalid as e:
+            return {"available": False, "why": str(e)}
+    if view == "claudemd":
+        return S.claude_md()
+    if view == "ollama":
+        return S.ollama_models()
+    if view == "rules":
+        return S.rules()
+    if view == "storage":
+        return S.storage()
+    if view == "claude":
+        from . import control as K
+        return K.claude_view()
+    if view == "allskills":
+        from . import control as K
+        return K.skills_inventory(_rid(q))
+    if view == "skilltext":
+        from . import control as K
+        return K.skill_text(_arg(q, "id"), _rid(q))
+    rid = _rid(q)
+    if not rid:
+        return {"available": False, "why": "No repo yet. Open Claude Code in a git repo; LFG builds its graphs "
+                                           "on the first session."}
+    if view == "overview":
+        return dash.overview(rid, _arg(q, "branch"))
+    if view == "runs":
+        return dash.runs(rid, _arg(q, "branch"))
+    if view == "run":
+        return dash.run_detail(rid, os.path.basename(_arg(q, "run")))
+    if view == "file":
+        return dash.run_file(rid, os.path.basename(_arg(q, "run")), _arg(q, "f"))
+    if view == "code":
+        return dash.code(rid)
+    if view == "architecture":
+        return dash.architecture(rid)
+    if view == "docs":
+        return dash.docs_index(rid)
+    if view == "doc":
+        return dash.doc(rid, _arg(q, "src"), _arg(q, "path"))
+    if view == "view":
+        return graph_view(rid, _arg(q, "kind"))
+    if view == "reviews":
+        return dash.reviews(rid, _arg(q, "branch"))
+    if view == "security":
+        return dash.security(rid, _arg(q, "branch"))
+    if view == "branches":
+        return dash.branches(rid)
+    if view == "usage":
+        return dash.usage(rid)
+    if view == "graphs":
+        return dash.graph_state(rid)
+    return {"available": False, "why": "unknown view"}
+
+
+MAX_BODY = 600_000
+NO_KEY = {"/api/save/graphs_build"}
+
+
+def save(what, body):
+    if what == "config":
+        return S.save_config(body.get("values"))
+    if what == "skill":
+        return S.save_skill(body.get("name"), body.get("text"))
+    if what == "skill_reset":
+        return S.reset_skill(body.get("name"))
+    if what == "claudemd":
+        return S.save_claude_md(body.get("text"))
+    if what == "ollama_pull":
+        return S.pull_model(body.get("name"))
+    if what == "storage_cleanup":
+        return S.cleanup(body.get("ids"))
+    if what == "rule":
+        return S.save_rule(body.get("name"), body.get("text"))
+    if what == "rule_reset":
+        return S.reset_rule(body.get("name"))
+    if what == "graphs_build":
+        return build_graphs(body.get("repo"), body.get("what"))
+    from . import control as K
+    actions = {
+        "repo_on": lambda: K.repo_on(body.get("root")), "repo_off": lambda: K.repo_off(body.get("root")),
+        "everywhere": lambda: K.everywhere(body.get("on")), "headroom": lambda: K.headroom_scope(body.get("scope")),
+        "hardened": lambda: K.hardened(body.get("on")), "pack_add": lambda: K.pack_add(body.get("name")),
+        "pack_remove": lambda: K.pack_remove(body.get("name")), "change_undo": lambda: K.change_undo(body.get("id")),
+        "legacy_fix": lambda: K.legacy_fix(body.get("id")),
+        "skill_auto": lambda: K.skill_auto(body.get("id"), bool(body.get("auto"))),
+    }
+    if what in actions:
+        res = actions[what]()
+        return res if isinstance(res, dict) else {"result": res}
+    raise S.Invalid("unknown setting")
+
+
+def build_graphs(rid, what):
+    """Start building/refreshing a repo's code map (or its docs) in the background, like the hooks do."""
+    from . import docs as D
+    from . import graphs as G
+    root = dash.repo_root(rid) if rid in dash.repo_ids() else None
+    if not root or not os.path.isdir(root):
+        raise S.Invalid("LFG doesn't know where this project is on disk; run `lfg init` in it once")
+    if what == "docs":
+        D.spawn_background(root)
+    elif what in ("update", "rebuild"):
+        G.spawn_background(root, rebuild=what == "rebuild")
+    else:
+        raise S.Invalid("unknown action")
+    return {"started": what}
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    server_version = "lfg-ui"
+    sys_version = ""
+    port = 0
+
+    def log_message(self, *a):
+        pass
+
+    def _send(self, code, body, ctype, csp=PAGE_CSP, extra=None):
+        data = body.encode() if isinstance(body, str) else body
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Cache-Control", "no-store")
+        if csp:
+            self.send_header("Content-Security-Policy", csp)
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        host = (self.headers.get("Host") or "").rsplit(":", 1)[0]
+        if host not in ("127.0.0.1", "localhost"):  # DNS-rebinding guard
+            return self._send(403, "forbidden", "text/plain")
+        u = urllib.parse.urlsplit(self.path)
+        if u.path in ("/", "/index.html"):
+            return self._asset("index.html")
+        if u.path.startswith("/assets/"):
+            return self._asset(u.path[len("/assets/"):])
+        if u.path.startswith("/api/"):
+            if self.headers.get("X-LFG") != "1":  # only the dashboard's own scripts may read the API
+                return self._send(403, json.dumps({"why": "forbidden"}), "application/json")
+            if u.path == "/api/unlocked":
+                return self._send(200, json.dumps({"ok": S.key_ok(self.headers.get("X-LFG-Key"))}),
+                                  "application/json")
+            try:
+                body = json.dumps(api(u.path[5:], urllib.parse.parse_qs(u.query)), default=str)
+            except Exception as e:  # keep the dashboard up
+                body = json.dumps({"available": False, "why": "error: %s" % type(e).__name__})
+            return self._send(200, body, "application/json")
+        if u.path.startswith("/static/"):
+            return self._static(urllib.parse.unquote(u.path[len("/static/"):]))
+        if u.path.startswith("/guide/"):
+            return self._guide(urllib.parse.unquote(u.path[len("/guide/"):]))
+        if u.path.startswith("/graphdata/"):
+            return self._graphdata(urllib.parse.unquote(u.path[len("/graphdata/"):]))
+        return self._send(404, "not found: %s" % html.escape(u.path), "text/plain")
+
+    def do_POST(self):
+        """Settings writes only: same host and origin, the dashboard's header, JSON, and the edit key. Building the
+        code map changes no settings or files of yours (the hooks start the same job), so it needs no key."""
+        def no(code, why):
+            return self._send(code, json.dumps({"ok": False, "why": why}), "application/json")
+        host = (self.headers.get("Host") or "").rsplit(":", 1)[0]
+        origins = {"http://%s:%d" % (h, self.port) for h in ("127.0.0.1", "localhost")}
+        if host not in ("127.0.0.1", "localhost") or self.headers.get("Origin") not in origins \
+                or self.headers.get("X-LFG") != "1":
+            return no(403, "forbidden")
+        u = urllib.parse.urlsplit(self.path)
+        if not u.path.startswith("/api/save/"):
+            return no(404, "not found")
+        if u.path not in NO_KEY and not S.key_ok(self.headers.get("X-LFG-Key")):
+            return no(403, "editing is locked: run `lfg ui --unlock` in your terminal")
+        size = int(self.headers.get("Content-Length") or 0)
+        if not (self.headers.get("Content-Type") or "").startswith("application/json") or not 0 < size <= MAX_BODY:
+            return no(400, "expected a JSON body")
+        try:
+            body = json.loads(self.rfile.read(size))
+            if not isinstance(body, dict):
+                raise ValueError
+        except ValueError:
+            return no(400, "invalid JSON")
+        try:
+            res = save(u.path[len("/api/save/"):], body)
+        except S.Invalid as e:
+            return no(400, str(e))
+        except Exception as e:  # keep the dashboard up, never echo internals
+            return no(500, "could not save (%s)" % type(e).__name__)
+        C.audit("ui-save", {"what": u.path[len("/api/save/"):], "name": body.get("name") or ""})
+        res["ok"] = True
+        return self._send(200, json.dumps(res), "application/json")
+
+    def _asset(self, name):
+        p = os.path.realpath(os.path.join(ASSETS, name))
+        ext = p.rsplit(".", 1)[-1]
+        if p.startswith(os.path.realpath(ASSETS) + os.sep) and ext in ASSET_TYPES and os.path.isfile(p):
+            with open(p, "rb") as fh:
+                return self._send(200, fh.read(), ASSET_TYPES[ext] + "; charset=utf-8")
+        return self._send(404, "not found", "text/plain")
+
+    def _static(self, rel):
+        """Tool-generated views under ~/.lfg/{graphs,ui,omnigraph}. Never JSON/DB files, never the repo."""
+        p = os.path.realpath(os.path.join(C.LFG_HOME, rel))
+        allowed = [os.path.realpath(C.lfg_path(d)) + os.sep for d in ("graphs", "ui", "omnigraph")]
+        ext = p.rsplit(".", 1)[-1]
+        if any(p.startswith(a) for a in allowed) and ext in ASSET_TYPES and os.path.isfile(p):
+            with open(p, "rb") as fh:
+                return self._send(200, fh.read(), ASSET_TYPES[ext] + "; charset=utf-8", csp=STATIC_CSP)
+        return self._send(404, "not found", "text/plain")
+
+    def _graphdata(self, rel):
+        """Generated graph views (html/js/css/svg) in a known repo's graph data dir: `<rid>/<crg|graphify>/<file>`.
+        Never graph.db/graph.json, never anything else in the repo."""
+        from . import graphs as G
+        parts = rel.split("/", 2)
+        if len(parts) != 3 or parts[0] not in dash.repo_ids() or parts[1] not in G.DATA:
+            return self._send(404, "not found", "text/plain")
+        base = G.data_dir(parts[0], parts[1])
+        if not base:
+            return self._send(404, "not found", "text/plain")
+        base = os.path.realpath(base)
+        p = os.path.realpath(os.path.join(base, parts[2]))
+        ext = p.rsplit(".", 1)[-1]
+        if p.startswith(base + os.sep) and ext in ASSET_TYPES and os.path.isfile(p):
+            with open(p, "rb") as fh:
+                return self._send(200, fh.read(), ASSET_TYPES[ext] + "; charset=utf-8", csp=STATIC_CSP)
+        return self._send(404, "not found", "text/plain")
+
+    def _guide(self, name):
+        """LFG's own user guide (docs/guide.html in the installed folder)."""
+        base = os.path.realpath(os.path.join(dash.LFG_ROOT, "docs"))
+        p = os.path.realpath(os.path.join(base, name))
+        ext = p.rsplit(".", 1)[-1]
+        if p.startswith(base + os.sep) and ext in ("html", "css", "svg") and os.path.isfile(p):
+            with open(p, "rb") as fh:
+                return self._send(200, fh.read(), ASSET_TYPES[ext] + "; charset=utf-8", csp=STATIC_CSP)
+        return self._send(404, "not found", "text/plain")
+
+
+def open_editor(port):
+    """Open the dashboard with the edit key in the URL fragment (never sent to a server, never printed)."""
+    return webbrowser.open("http://127.0.0.1:%d/#unlock=%s" % (port, S.edit_key()))
+
+
+def serve(port, open_browser=True):
+    Handler.port = port
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    srv.daemon_threads = True
+    # tool/MCP checks take a few seconds; warm them so the first overview shows every integration
+    threading.Thread(target=dash.tools, daemon=True).start()
+    print("LFG dashboard: http://127.0.0.1:%d  (Ctrl-C to stop)" % port)
+    if open_browser:
+        threading.Timer(0.5, open_editor, (port,)).start()
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass

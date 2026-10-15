@@ -1,0 +1,7 @@
+# Lint config for the LFG CLI (stdlib only, Python 3.9+). Author: Varun Singh.
+line-length = 120
+target-version = "py39"
+
+[lint]
+select = ["E", "F", "W", "B"]
+

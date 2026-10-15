@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "code-review-graph": { "command": "${CLAUDE_PLUGIN_ROOT}/bin/lfg", "args": ["mcp", "code-review-graph"] },
+    "dev-graph": { "command": "${CLAUDE_PLUGIN_ROOT}/bin/lfg", "args": ["mcp", "dev-graph"] },
+    "second-brain": { "command": "${CLAUDE_PLUGIN_ROOT}/bin/lfg", "args": ["mcp", "second-brain"] },
+    "headroom": { "command": "${CLAUDE_PLUGIN_ROOT}/bin/lfg", "args": ["mcp", "headroom"] }
+  }
+}

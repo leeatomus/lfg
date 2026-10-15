@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: tests (macOS, Python ${{ matrix.python }})
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.9", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Unit and install-flow tests (sandboxed HOME, fake claude)
+        run: python -m unittest discover -s tests -v
+      - name: Installer dry run changes nothing
+        run: |
+          export HOME="$(mktemp -d)"
+          ./install.sh --dry-run
+          test -z "$(ls -A "$HOME")" || { echo "dry run wrote to HOME:"; ls -la "$HOME"; exit 1; }
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: ruff
+        run: pipx run ruff check plugin/lib plugin/bin/lfg tests
+      - name: shellcheck
+        run: shellcheck install.sh bootstrap.sh
+      - name: JSON manifests parse
+        run: |
+          for f in plugin/.claude-plugin/*.json plugin/hooks/hooks.json plugin/.mcp.json; do
+            python3 -m json.tool "$f" > /dev/null || { echo "bad JSON: $f"; exit 1; }
+          done

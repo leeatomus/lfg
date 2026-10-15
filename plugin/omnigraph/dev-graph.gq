@@ -1,0 +1,46 @@
+// LFG queries for dev-graph · author Varun Singh
+// Keyword search (bm25) runs inside the local Omnigraph server: no API key, no network.
+// Use these instead of the cookbook's search_* queries, which need an embedding API key LFG never sets up.
+// Pass the full text of the query you need to the MCP `query` tool, with its name and params.
+
+query find_decisions($q: String) {
+    match { $d: Decision }
+    return { $d.slug, $d.title, $d.status, $d.decision }
+    order { bm25($d.title, $q) }
+    limit 5
+}
+
+query find_learnings($q: String) {
+    match { $l: Learning }
+    return { $l.slug, $l.title, $l.learningKind, $l.body }
+    order { bm25($l.title, $q) }
+    limit 5
+}
+
+query find_invariants($q: String) {
+    match { $i: Invariant }
+    return { $i.slug, $i.statement, $i.status, $i.guardRef }
+    order { bm25($i.statement, $q) }
+    limit 5
+}
+
+query find_principles($q: String) {
+    match { $p: Principle }
+    return { $p.slug, $p.statement, $p.polarity, $p.status }
+    order { bm25($p.statement, $q) }
+    limit 5
+}
+
+query find_gaps($q: String) {
+    match { $g: Gap }
+    return { $g.slug, $g.title, $g.state }
+    order { bm25($g.title, $q) }
+    limit 5
+}
+
+query find_issues($q: String) {
+    match { $i: Issue }
+    return { $i.slug, $i.title, $i.status, $i.issueType }
+    order { bm25($i.title, $q) }
+    limit 5
+}

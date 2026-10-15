@@ -1,0 +1,837 @@
+"""Data for the `lfg ui` dashboard: one read-only view over every tool LFG uses.
+
+code-review-graph (SQLite, read-only) · graphify (graph.json + GRAPH_REPORT.md) · generated docs/playbooks ·
+Omnigraph dev-graph + second-brain (reader role) · Linear (through the dev-graph mirror; the dashboard never
+calls Linear) · Headroom (`headroom savings --json`) · LFG runs, gates, reviews, security and usage.db.
+
+Every function returns plain JSON-able data and degrades to {"available": False, "why": ...} instead of
+raising, so one missing tool never takes the dashboard down. Never returns secrets. Author: Varun Singh.
+"""
+import collections
+import fnmatch
+import glob
+import json
+import os
+import re
+import sqlite3
+import threading
+import time
+import urllib.request
+
+from . import common as C
+from . import docs as D
+
+STAGES = [  # (key, label, file glob) in pipeline order
+    ("brief", "Brief", "01-brief.md"), ("design", "Design", "02-design.md"), ("tasks", "Tasks", "tasks.json"),
+    ("build", "Build", "03-build-*.md"), ("qa", "QA", "04-qa.md"), ("gate", "Gate", "ready.json"),
+    ("secure", "Secure", "05-secure.json"), ("review", "Review", "06-review.json"),
+    ("ship", "Ship check", "07-shipcheck.json"), ("packet", "Ship packet", "COMMIT_MSG.md"),
+]
+
+
+# ---------------------------------------------------------------- small cache
+
+_CACHE, _CLOCK = {}, threading.Lock()
+
+
+def cached(key, ttl, fn):
+    now = time.time()
+    with _CLOCK:
+        hit = _CACHE.get(key)
+        if hit and now - hit[0] < ttl:
+            return hit[1]
+    val = fn()
+    with _CLOCK:
+        _CACHE[key] = (now, val)
+    return val
+
+
+def _na(why):
+    return {"available": False, "why": why}
+
+
+# ---------------------------------------------------------------- repos + runs
+
+def repo_ids():
+    ids = set()
+    for d in ("runs", "graphs"):
+        if os.path.isdir(C.lfg_path(d)):
+            ids |= {i for i in os.listdir(C.lfg_path(d)) if not i.startswith(".")
+                    and os.path.isdir(C.lfg_path(d, i))}
+    return sorted(ids)
+
+
+def repo_root(rid):
+    return (C.read_json(C.lfg_path("graphs", rid, "state.json"), {}) or {}).get("repo_root")
+
+
+def repos():
+    out = []
+    for rid in repo_ids():
+        st = C.read_json(C.lfg_path("graphs", rid, "state.json"), {}) or {}
+        root = st.get("repo_root")
+        out.append({"id": rid, "root": root, "synced_at": st.get("synced_at"), "error": bool(st.get("last_error")),
+                    "name": os.path.basename((root or "").rstrip("/")) or re.sub(r"-[0-9a-f]{8}$", "", rid),
+                    "branch": C.git_branch(root) if root and os.path.isdir(root) else ""})
+    clash = collections.Counter(r["name"] for r in out)
+    for r in out:  # two checkouts with the same folder name: show where each lives
+        if clash[r["name"]] > 1:
+            r["name"] += " (%s)" % os.path.basename(os.path.dirname((r["root"] or "").rstrip("/")) or r["id"])
+    out.sort(key=lambda r: r.get("synced_at") or "", reverse=True)
+    return {"repos": out}
+
+
+# ---------------------------------------------------------------- branches
+# Runs record the branch they were started on (run.json "branch"); runs from before that have none. The graphs are one
+# copy per repo that follows whatever branch is checked out, so they are not filtered by branch.
+UNRECORDED = "-"
+
+
+def run_branch(d):
+    return (C.read_json(os.path.join(d, "run.json"), {}) or {}).get("branch") or ""
+
+
+def _branch_ok(d, branch):
+    return not branch or (run_branch(d) or UNRECORDED) == branch
+
+
+def _run_files(rid, name, branch=None):
+    """Newest first: runs/<rid>/*/<name> for runs on `branch` (None or "" = every branch, "-" = not recorded)."""
+    if not name:  # the run folders themselves
+        return [d for d in sorted(glob.glob(C.lfg_path("runs", rid, "*")), reverse=True)
+                if os.path.isdir(d) and _branch_ok(d, branch)]
+    return [p for p in sorted(glob.glob(C.lfg_path("runs", rid, "*", name)), reverse=True)
+            if _branch_ok(os.path.dirname(p), branch)]
+
+
+def git_branches(root):
+    """Local branches, which are merged into the default branch, the default branch and the checked-out one."""
+    if not root or not os.path.isdir(root):
+        return None
+    def g(*a):
+        cp = C.run(["git"] + list(a), cwd=root, timeout=15)
+        return cp.stdout.split() if cp.returncode == 0 else []
+    local = g("for-each-ref", "refs/heads", "--format=%(refname:short)")
+    head = (g("symbolic-ref", "--short", "refs/remotes/origin/HEAD") or [""])[0].split("/", 1)[-1]
+    default = head if head in local else next((b for b in ("main", "master", "develop") if b in local), "")
+    merged = set(g("branch", "--merged", default, "--format=%(refname:short)")) - {default} if default else set()
+    return {"local": local, "merged": merged, "default": default, "current": C.git_branch(root)}
+
+
+def branches(rid):
+    counts = collections.Counter(run_branch(d) or UNRECORDED for d in _run_files(rid, ""))
+    gb = git_branches(repo_root(rid))
+    names = set(counts) - {UNRECORDED} | ({gb["current"]} if gb and gb["current"] else set())
+    out = []
+    for b in sorted(names):
+        state = "unknown" if gb is None else ("current" if b == gb["current"] else "default" if b == gb["default"]
+                                              else "merged" if b in gb["merged"] else "local" if b in gb["local"]
+                                              else "deleted")
+        out.append({"name": b, "runs": counts.get(b, 0), "state": state})
+    out.sort(key=lambda x: (x["state"] != "current", x["name"]))
+    return {"branches": out, "current": gb["current"] if gb else "", "unrecorded": counts.get(UNRECORDED, 0),
+            "graphs_follow": gb["current"] if gb else ""}
+
+
+def _stage_state(d):
+    files = set(os.listdir(d))
+    done = {}
+    for key, _label, pat in STAGES:
+        done[key] = any(fnmatch.fnmatch(f, pat) for f in files)
+    return done
+
+
+def _verdict(v):
+    """05-secure.json verdicts are a string or {"overall": ..., "blocking": [...]}."""
+    return v.get("overall") if isinstance(v, dict) else v
+
+
+def _blocking(s):
+    b = s.get("blocking")
+    if isinstance(b, int) and not isinstance(b, bool):
+        return b
+    v = s.get("verdict")
+    if isinstance(v, dict) and isinstance(v.get("blocking"), list):
+        return len(v["blocking"])
+    return sum(1 for f in s.get("findings", []) if isinstance(f, dict) and f.get("blocking") is True)
+
+
+def _about(d, review=None):
+    """(title, one-paragraph description) of a run, from the brief's heading and Problem section."""
+    title, about, section = "", "", None
+    for line in C.read_text(os.path.join(d, "01-brief.md")).splitlines():
+        s = line.strip()
+        if s.startswith("# ") and not title:
+            title = s[2:].split(":", 1)[-1].strip() if s[2:].lower().startswith("brief:") else s[2:].strip()
+        elif s.startswith("#"):
+            if about:
+                break
+            section = s.lstrip("#").strip().lower()
+        elif s and section in (None, "problem", "summary", "goal", "what") and not s.startswith(("-", "|", "```")):
+            about += (" " if about else "") + s
+        elif not s and about:
+            break
+    if not about and isinstance(review, dict):  # review-only runs: the review's own summary
+        s = review.get("summary") or ""
+        about = "Review: " + "; ".join(str(v) for v in s.values()) if isinstance(s, dict) else str(s)
+    return title, about[:400]
+
+
+def _run_summary(d):
+    meta = C.read_json(os.path.join(d, "run.json"), {}) or {}
+    rd = C.read_json(os.path.join(d, "ready.json"), None)
+    sc = C.read_json(os.path.join(d, "07-shipcheck.json"), None)
+    rv = C.read_json(os.path.join(d, "06-review.json"), None)
+    se = C.read_json(os.path.join(d, "05-secure.json"), None)
+    tasks = C.read_json(os.path.join(d, "tasks.json"), None)
+    tl = tasks if isinstance(tasks, list) else (tasks or {}).get("tasks", []) if isinstance(tasks, dict) else []
+    stages = _stage_state(d)
+    title, about = _about(d, rv)
+    return {"run": os.path.basename(d), "slug": meta.get("slug"), "created": meta.get("created"),
+            "title": title, "about": about,
+            "branch": meta.get("branch") or "",
+            "lane": meta.get("lane"), "stage": meta.get("stage"), "issue": meta.get("issue"),
+            "stages": stages, "progress": sum(stages.values()),
+            "ready": None if rd is None else ("green" if rd.get("green") else "red"),
+            "review": (rv or {}).get("verdict"), "secure": _verdict((se or {}).get("verdict")),
+            "shipcheck": None if sc is None else ("pass" if sc.get("pass") else "fail"),
+            "tasks": {"total": len(tl), "done": sum(1 for t in tl if isinstance(t, dict) and t.get("passes"))}}
+
+
+def runs(rid, branch=None):
+    cur = C.read_text(C.lfg_path("runs", rid, "CURRENT")).strip()
+    out = []
+    for d in _run_files(rid, "", branch)[:100]:
+        if os.path.isdir(d):
+            r = _run_summary(d)
+            r["current"] = r["run"] == cur
+            out.append(r)
+    return {"runs": out, "stages": [[k, label] for k, label, _ in STAGES]}
+
+
+def run_detail(rid, run):
+    d = C.lfg_path("runs", rid, run)
+    if not os.path.isdir(d):
+        return _na("run not found")
+    files = []
+    for root, _dirs, fs in os.walk(d):
+        for f in sorted(fs):
+            p = os.path.join(root, f)
+            files.append({"name": os.path.relpath(p, d), "size": os.path.getsize(p),
+                          "mtime": time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(p)))})
+    tasks = C.read_json(os.path.join(d, "tasks.json"), None)
+    tl = tasks if isinstance(tasks, list) else (tasks or {}).get("tasks", []) if isinstance(tasks, dict) else []
+    ready = C.read_json(os.path.join(d, "ready.json"), None) or {}
+    return dict(_run_summary(d), files=files, tasks_list=tl,
+                checks=[dict({k: c.get(k) for k in ("name", "cmd", "exit", "seconds")},
+                             tail=str(c.get("tail") or "")[-2000:]) for c in ready.get("checks", [])])
+
+
+def run_file(rid, run, name):
+    base = os.path.realpath(C.lfg_path("runs", rid, run))
+    p = os.path.realpath(os.path.join(base, name))
+    if not p.startswith(base + os.sep) or not os.path.isfile(p):
+        return {"text": "not found"}
+    with open(p, errors="replace") as fh:
+        return {"text": fh.read(400000), "name": name}
+
+
+# ---------------------------------------------------------------- code-review-graph
+
+def code(rid, full=True):
+    db = D.crg_db(rid)
+    if not db:
+        return _na("No code-review-graph data yet. Run `lfg graphs ensure` in the repo.")
+    root = repo_root(rid)
+    def q(sql, *a):
+        return db.execute(sql, a).fetchall()
+    try:
+        meta = dict(q("SELECT key, value FROM metadata WHERE key IN ('last_updated','git_branch','git_head_sha',"
+                      "'last_build_type','build_state')"))
+        cov = dict(q("SELECT test_coverage, count(*) FROM risk_index GROUP BY 1"))
+        out = {"available": True, "meta": meta,
+               "nodes": dict(q("SELECT kind, count(*) FROM nodes GROUP BY 1")),
+               "edges": dict(q("SELECT kind, count(*) FROM edges GROUP BY 1")),
+               "flows": q("SELECT count(*) FROM flows")[0][0],
+               "communities": q("SELECT count(*) FROM communities")[0][0],
+               "coverage": {"tested": cov.get("tested", 0), "untested": cov.get("untested", 0)},
+               "security_untested": q("SELECT count(*) FROM risk_index WHERE security_relevant=1 AND "
+                                      "test_coverage='untested'")[0][0]}
+
+        def sym(qn):
+            f, s = D._qual(qn, root)
+            return {"file": f, "symbol": s}
+
+        lim = 60 if full else 6
+        out["hotspots"] = [dict(sym(r[0]), risk=round(r[1], 2), callers=r[2], coverage=r[3], security=bool(r[4]))
+                           for r in q("SELECT qualified_name, risk_score, caller_count, test_coverage, "
+                                      "security_relevant FROM risk_index ORDER BY risk_score DESC, caller_count "
+                                      "DESC LIMIT ?", lim)]
+        if not full:
+            return out
+        out["languages"] = dict(q("SELECT COALESCE(language,'?'), count(*) FROM nodes WHERE kind='File' "
+                                  "GROUP BY 1 ORDER BY 2 DESC LIMIT 12"))
+        out["flow_list"] = [{"name": r[0], "nodes": r[1], "files": r[2], "criticality": round(r[3], 2),
+                             "depth": r[4], "entry": D._short(r[5] or "", root)}
+                            for r in q("SELECT f.name, f.node_count, f.file_count, f.criticality, f.depth, "
+                                       "n.file_path FROM flows f LEFT JOIN nodes n ON n.id=f.entry_point_id "
+                                       "ORDER BY f.criticality DESC LIMIT 60")]
+        out["community_list"] = [{"name": r[0], "size": r[1], "cohesion": round(r[2], 2), "language": r[3],
+                                  "purpose": r[4] or r[6] or "", "key_symbols": json.loads(r[5] or "[]")[:6]}
+                                 for r in q("SELECT c.name, c.size, c.cohesion, c.dominant_language, s.purpose, "
+                                            "s.key_symbols, c.description FROM communities c LEFT JOIN "
+                                            "community_summaries s ON s.community_id=c.id ORDER BY c.size DESC")]
+        out["large_functions"] = [{"symbol": r[0], "file": D._short(r[1], root), "lines": r[2], "kind": r[3]}
+                                  for r in q("SELECT name, file_path, line_end-line_start+1 AS n, kind FROM nodes "
+                                             "WHERE kind IN ('Function','Class') AND line_end IS NOT NULL "
+                                             "ORDER BY n DESC LIMIT 25")]
+        out["graph_html"] = bool(D.data(rid, "crg") and glob.glob(D.data(rid, "crg", "*.html")))
+        return out
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------- graphify
+
+def architecture(rid, full=True):
+    g = D.graphify_graph(rid)
+    if not g:
+        return _na("No graphify graph yet. Run `lfg graphs ensure` in the repo.")
+    nodes = g.get("nodes", [])
+    deg = g["_degree"]
+    byid = {n["id"]: n for n in nodes}
+    comm = collections.Counter(n.get("community_name") or "?" for n in nodes)
+    gods = [byid[i] for i, _ in deg.most_common(80) if i in byid and byid[i].get("file_type") == "code"][:25]
+    out = {"available": True, "nodes": len(nodes), "links": len(g.get("links", [])), "communities": len(comm),
+           "types": dict(collections.Counter(n.get("file_type") for n in nodes)),
+           "commit": g.get("built_at_commit"),
+           "gods": [{"label": n.get("label"), "edges": deg[n["id"]], "file": n.get("source_file"),
+                     "area": n.get("community_name")} for n in (gods if full else gods[:6])]}
+    if not full:
+        return out
+    files = collections.defaultdict(collections.Counter)
+    for n in nodes:
+        if n.get("source_file"):
+            files[n.get("community_name") or "?"][n["source_file"]] += 1
+    out["community_list"] = [{"name": c, "size": s, "files": [f for f, _ in files[c].most_common(3)]}
+                             for c, s in comm.most_common(60)]
+    rel = collections.Counter(e.get("relation") for e in g.get("links", []))
+    out["relations"] = dict(rel.most_common(10))
+    out["rationale"] = [{"note": n.get("label"), "file": n.get("source_file"), "line": n.get("source_location")}
+                        for n in nodes if n.get("file_type") == "rationale"][:100]
+    s = D.report_sections(rid)
+    out["report"] = {k: D.section(s, k) for k in ("Corpus Check", "Summary", "Surprising", "Import Cycles")}
+    out["graph_html"] = bool(D.data(rid, "graphify")) and os.path.exists(D.data(rid, "graphify", "graph.html"))
+    out["callflow_html"] = bool(D.data(rid, "graphify")) and os.path.exists(D.data(rid, "graphify", "callflow.html"))
+    return out
+
+
+# ---------------------------------------------------------------- docs + playbooks
+
+DOC_SOURCES = [  # (id, title, base dir: relative to ~/.lfg, or {graphify}/{crg} = the repo's graph data, description)
+    ("playbooks", "Start here", "playbooks/{rid}", "onboarding tour, landmines, test gaps, incident runbooks"),
+    ("guides", "From your docs", "{graphify}/wiki", "what your team's own docs and runbooks say"),
+    ("gwiki", "Parts of the code", "{graphify}/wiki", "one page per area of the code, largest first"),
+    ("repo", "Decisions", "repos/{rid}/docs", "decision records and notes LFG keeps for this project"),
+]
+
+
+def _doc_base(rid, base):
+    for kind in ("graphify", "crg"):
+        tag = "{%s}" % kind
+        if base.startswith(tag):
+            d = D.data(rid, kind)
+            return d + base[len(tag):] if d else ""
+    return C.lfg_path(base.format(rid=rid))
+
+
+def _title(path):
+    try:
+        with open(path, errors="replace") as fh:
+            for line in fh:
+                if line.startswith("# "):
+                    return line[2:].strip()[:120]
+    except OSError:
+        pass
+    return os.path.splitext(os.path.basename(path))[0].replace("_", " ")
+
+
+MIN_AREA_NODES = 10
+
+
+def docs_index(rid):
+    groups = []
+    for sid, title, base, desc in DOC_SOURCES:
+        d = _doc_base(rid, base)
+        if sid in ("guides", "gwiki"):
+            pages = D.wiki_pages(rid)
+            if sid == "guides":
+                items = [{"path": p["path"], "title": p["title"], "tag": "runbook" if p["runbook"] else ""}
+                         for p in pages if p["kind"] == "doc"]
+            else:
+                # areas big enough to be worth a page; tiny clusters and single-symbol pages are noise to a reader
+                items = [{"path": p["path"], "title": p["title"], "tag": "tests" if p["tests"] else ""}
+                         for p in pages if p["kind"] == "code" and p["nodes"] >= MIN_AREA_NODES]
+        else:
+            paths = sorted(glob.glob(os.path.join(d, "**", "*.md"), recursive=True)) if os.path.isdir(d) else []
+            items = [{"path": os.path.relpath(p, d), "title": _title(p)} for p in paths]
+            items.sort(key=lambda i: (0 if i["path"] in ("index.md", "onboarding.md") else 1, i["title"].lower()))
+        if sid in ("guides", "gwiki"):  # two areas in the same folder: tell them apart by their main file
+            lead = {p["path"]: p["lead"] for p in pages}
+            seen = collections.Counter(i["title"] for i in items)
+            for i in items:
+                if seen[i["title"]] > 1 and lead.get(i["path"]):
+                    i["title"] += " · " + lead[i["path"]]
+        groups.append({"id": sid, "title": title, "description": desc, "items": items})
+    return {"groups": groups, "state": D.docs_state(rid), "due": D.due(rid)}
+
+
+def doc(rid, src, path):
+    base = dict((s[0], s[2]) for s in DOC_SOURCES).get(src)
+    if not base or not path.endswith(".md") or not _doc_base(rid, base):
+        return {"text": "not found"}
+    b = os.path.realpath(_doc_base(rid, base))
+    p = os.path.realpath(os.path.join(b, path))
+    if not p.startswith(b + os.sep) or not os.path.isfile(p):
+        return {"text": "not found"}
+    with open(p, errors="replace") as fh:
+        return {"text": fh.read(600000), "src": src, "path": path}
+
+
+# ---------------------------------------------------------------- Help: LFG's own docs, skills and agents
+
+# The installed LFG folder (~/.lfg, or the source checkout when run from there): holds plugin/, docs/, CONTRACT.md.
+LFG_ROOT = C.LFG_ROOT
+GUIDE_DOCS = (("sharing", "Share LFG with your team", "docs/sharing.md"),
+              ("dashboard", "The dashboard", "docs/dashboard.md"),
+              ("cli", "CLI reference", "CONTRACT.md"))
+
+
+def _frontmatter(path):
+    """`name` / `description` (incl. folded `>` blocks) from a SKILL.md or agent .md header."""
+    try:
+        with open(path, errors="replace") as fh:
+            lines = fh.read(8000).splitlines()
+    except OSError:
+        return {}
+    if not lines or lines[0].strip() != "---":
+        return {}
+    out, key = {}, None
+    for line in lines[1:]:
+        if line.strip() == "---":
+            break
+        m = re.match(r"^([A-Za-z_-]+):\s*(.*)$", line)
+        if m:
+            key, val = m.group(1), m.group(2).strip()
+            out[key] = "" if val in (">", "|", ">-", "|-") else val.strip("\"'")
+        elif key and line.startswith((" ", "\t")):
+            out[key] = (out[key] + " " + line.strip()).strip()
+    return out
+
+
+def guide():
+    plugin = os.path.join(LFG_ROOT, "plugin")
+    skills = []
+    for p in sorted(glob.glob(os.path.join(plugin, "skills", "*", "SKILL.md"))):
+        fm = _frontmatter(p)
+        skills.append({"name": "/lfg:" + (fm.get("name") or os.path.basename(os.path.dirname(p))),
+                       "description": fm.get("description", "")})
+    agents = []
+    for p in sorted(glob.glob(os.path.join(plugin, "agents", "*.md"))):
+        fm = _frontmatter(p)
+        agents.append({"name": fm.get("name") or os.path.basename(p)[:-3], "description": fm.get("description", ""),
+                       "model": fm.get("model", ""), "tools": fm.get("tools", "")})
+    rules = sorted(os.path.basename(p)[:-3] for p in glob.glob(os.path.join(plugin, "rules", "*.md")))
+    manifest = C.read_json(os.path.join(plugin, ".claude-plugin", "plugin.json")) or {}
+    return {"version": manifest.get("version", "?"), "root": LFG_ROOT,
+            "has_guide": os.path.isfile(os.path.join(LFG_ROOT, "docs", "guide.html")),
+            "docs": [{"id": i, "title": t} for i, t, f in GUIDE_DOCS if os.path.isfile(os.path.join(LFG_ROOT, f))],
+            "skills": skills, "agents": agents, "rules": rules}
+
+
+def guide_doc(doc_id):
+    rel = dict((i, f) for i, _, f in GUIDE_DOCS).get(doc_id)
+    if not rel:
+        return {"text": "not found"}
+    with open(os.path.join(LFG_ROOT, rel), errors="replace") as fh:
+        return {"text": fh.read(400000)}
+
+
+# ---------------------------------------------------------------- Omnigraph: dev-graph, Linear mirror, second-brain
+
+def _og(fn, *a):
+    from . import omnigraph as OG
+    try:
+        return fn(OG, *a)
+    except Exception as e:
+        return {"error": "%s" % (getattr(e, "reason", None) or type(e).__name__)}
+
+
+def _og_ready(name):
+    from . import omnigraph as OG
+    try:
+        return OG.ready(name, timeout=1)
+    except Exception:
+        return False
+
+
+def _list(name, node, fields, order=None, limit=200):
+    var = "$x"
+    q = "query l() { match { %s: %s } return { %s }%s limit %d }" % (
+        var, node, ", ".join("%s.%s" % (var, f) for f in fields),
+        " order { %s.%s desc }" % (var, order) if order else "", limit)
+    return _og(lambda OG: OG.read(name, q, "l"))
+
+
+def _inv(name, stored, params=None):
+    return _og(lambda OG: OG.invoke(name, stored, params))
+
+
+def _rows(v):
+    return v if isinstance(v, list) else []
+
+
+def issues():
+    if not _og_ready("dev-graph"):
+        return _na("dev-graph is not running. Run `lfg omnigraph status` (then `lfg omnigraph restart dev-graph`).")
+    ws = C.config()["linear"].get("workspace") or ""
+    allq = _list("dev-graph", "Issue", ["slug", "title", "description", "acceptanceCriteria", "status", "priority",
+                                        "issueType", "legacyRef", "updatedAt"], "updatedAt", 300)
+    out = {"available": True, "linear_workspace": ws,
+           "issues": _rows(allq), "error": allq.get("error") if isinstance(allq, dict) else None,
+           "ready": _rows(_inv("dev-graph", "ready")), "blocked": _rows(_inv("dev-graph", "blocked")),
+           "stale": _rows(_inv("dev-graph", "stale_candidates")), "epics": _rows(_inv("dev-graph", "open_epics")),
+           "prs": _rows(_list("dev-graph", "PR", ["slug", "title", "status", "githubRef", "updatedAt"],
+                              "updatedAt", 100))}
+    out["by_status"] = dict(collections.Counter(i.get("status") or "?" for i in out["issues"]))
+    return out
+
+
+def knowledge():
+    if not _og_ready("dev-graph"):
+        return _na("dev-graph is not running. Run `lfg omnigraph status`.")
+    return {
+        "available": True,
+        "decisions": _rows(_list("dev-graph", "Decision", ["slug", "title", "status", "decision", "createdAt"],
+                                 "createdAt")),
+        "principles": _rows(_list("dev-graph", "Principle", ["slug", "statement", "polarity", "status",
+                                                             "rationale"], "updatedAt")),
+        "invariants": _rows(_list("dev-graph", "Invariant", ["slug", "statement", "status", "guardRef"],
+                                  "updatedAt")),
+        "unheld": _rows(_inv("dev-graph", "unheld_invariants")),
+        "gaps": _rows(_list("dev-graph", "Gap", ["slug", "title", "state", "currentBehavior", "targetBehavior"],
+                            "updatedAt")),
+        "learnings": _rows(_list("dev-graph", "Learning", ["slug", "title", "learningKind", "body", "createdAt"],
+                                 "createdAt")),
+        "incidents": _rows(_list("dev-graph", "Incident", ["slug", "title", "severity", "status", "startedAt"],
+                                 "startedAt")),
+        "components": _rows(_list("dev-graph", "Component", ["slug", "name", "criticality", "summary"],
+                                  "updatedAt")),
+    }
+
+
+def brain():
+    if not _og_ready("second-brain"):
+        return _na("second-brain is not running. Run `lfg omnigraph status`.")
+    notes = _rows(_inv("second-brain", "notes_recent"))
+    return {"available": True, "notes": notes,
+            "kinds": dict(collections.Counter(n.get("kind") or "?" for n in notes)),
+            "preferences": _rows(_inv("second-brain", "notes_by_kind", {"kind": "preference"})),
+            "insights": _rows(_inv("second-brain", "notes_by_kind", {"kind": "insight"})),
+            "questions": _rows(_inv("second-brain", "open_questions")),
+            "principles": _rows(_inv("second-brain", "principles_all")),
+            "tasks": _rows(_inv("second-brain", "tasks_next")),
+            "projects": _rows(_inv("second-brain", "projects_active"))}
+
+
+# ---------------------------------------------------------------- reviews + security
+
+def reviews(rid, branch=None):
+    findings, blocked, verdicts = [], [], []
+    fb = C.read_json(C.lfg_path("feedback", rid + ".json"), {}) or {}
+    for p in _run_files(rid, "06-review.json", branch):
+        rv = C.read_json(p, {}) or {}
+        run = os.path.basename(os.path.dirname(p))
+        verdicts.append({"run": run, "verdict": rv.get("verdict"), "findings": len(rv.get("findings", []))})
+        for f in rv.get("findings", []):
+            findings.append(dict(f, run=run, feedback=(fb.get(f.get("id")) or {}).get("verdict")))
+    for e in _audit(400):
+        if e.get("event") == "blocked":
+            blocked.append(e)
+    rules = dict(collections.Counter(str(e.get("rule")) for e in blocked))
+    return {"findings": findings, "verdicts": verdicts, "blocked": blocked[:200], "blocked_by_rule": rules}
+
+
+def security(rid, branch=None):
+    sec, pen = [], []
+    for p in _run_files(rid, "05-secure.json", branch):
+        s = C.read_json(p, {}) or {}
+        inv = s.get("inventory") or {}
+        sec.append({"run": os.path.basename(os.path.dirname(p)), "ts": s.get("ts"),
+                    "verdict": _verdict(s.get("verdict")),
+                    "blocking": _blocking(s), "mode": s.get("mode"), "scope": s.get("scope"),
+                    "inventory": {k: len(v) for k, v in inv.items() if isinstance(v, list)},
+                    "scanners": [{"tool": x.get("tool"), "exit": x.get("exit"), "note": x.get("note")}
+                                 for x in s.get("scanners", [])],
+                    "findings": s.get("findings", [])[:200]})
+    for p in _run_files(rid, "05-pentest.json", branch):
+        s = C.read_json(p, {}) or {}
+        keep = ("mode", "model", "status", "next_steps", "preflight_failures")
+        pen.append({"run": os.path.basename(os.path.dirname(p)), **{k: s.get(k) for k in keep},
+                    "summary": s.get("summary") or s.get("conclusion")})
+    ships = []
+    for p in _run_files(rid, "07-shipcheck.json", branch)[:10]:
+        s = C.read_json(p, {}) or {}
+        checks = (s.get("part_a") or {}).get("checks", []) + (s.get("part_b") or {}).get("checks", [])
+        ships.append({"run": os.path.basename(os.path.dirname(p)), "pass": s.get("pass"),
+                      "ok": sum(1 for c in checks if c.get("ok")), "total": len(checks),
+                      "failed": [c.get("check") for c in checks if c.get("ok") is False],
+                      "failures": [{"check": c.get("check"), "detail": str(c.get("detail") or "")[-1500:]}
+                                   for c in checks if c.get("ok") is False]})
+    return {"secure": sec, "pentest": pen, "shipcheck": ships}
+
+
+# ---------------------------------------------------------------- usage + Headroom
+
+def _headroom():
+    if not C.which("headroom"):
+        return _na("headroom is not installed")
+    cp = C.run(["headroom", "savings", "--json"], timeout=20)
+    try:
+        d = json.loads(cp.stdout)
+    except ValueError:
+        return _na("headroom savings returned no data")
+    d.pop("path", None)
+    d["available"] = True
+    return d
+
+
+def headroom():
+    return in_background("headroom", 60, _headroom, "checking Headroom")
+
+
+def _tokensave_uploads():
+    """tokensave can send token counts to a worldwide counter; LFG only runs it with that switched off."""
+    cfg = C.read_text(os.path.join(C.HOME, ".tokensave", "config.toml"))
+    m = re.search(r"^\s*upload_enabled\s*=\s*(\w+)", cfg, re.M)
+    return not m or m.group(1).lower() != "false"
+
+
+_BUSY = {}
+
+
+def in_background(key, ttl, fn, doing):
+    """Cached value of fn(), refreshed in a background thread with at most one run per key in flight, so a slow or
+    stuck external tool never holds up a page. Until the first run finishes, says it is pending."""
+    with _CLOCK:
+        hit = _CACHE.get(key)
+        lock = _BUSY.setdefault(key, threading.Lock())
+    if hit and time.time() - hit[0] < ttl:
+        return hit[1]
+    if lock.acquire(blocking=False):
+        def work():
+            try:
+                val = fn()
+                with _CLOCK:
+                    _CACHE[key] = (time.time(), val)
+            finally:
+                lock.release()
+        threading.Thread(target=work, daemon=True).start()
+    return hit[1] if hit else {"available": False, "pending": True, "why": doing}
+
+
+def spend():
+    """Dollars spent, as tokensave computes them from Claude Code's own session logs (all projects)."""
+    return in_background("spend", 300, _spend, "working out costs")
+
+
+def _spend():
+    if not C.which("tokensave"):
+        return _na("tokensave is not installed")
+    if _tokensave_uploads():
+        return _na("tokensave's upload counter is on; run `tokensave disable-upload-counter` to show costs here")
+    out = {"available": True}
+    for rng in ("today", "7d", "30d"):
+        cp = C.run(["tokensave", "cost", rng, "--by-model", "--export", "json"], timeout=20)
+        text = cp.stdout or ""
+        try:
+            d = json.loads(text[text.index("{"):])
+        except ValueError:
+            return _na("tokensave cost returned no data")
+        out[rng] = round(float(d.get("total_cost_usd") or 0), 2)
+        if rng == "30d":
+            out["models"] = [{"model": m.get("model"), "usd": round(float(m.get("cost") or 0), 2)}
+                             for m in d.get("by_model") or [] if (m.get("cost") or 0) >= 0.01]
+    return out
+
+
+def usage(rid):
+    p = C.lfg_path("usage.db")
+    out = {"rows": [], "days": [], "models": [], "headroom": headroom(), "spend": spend()}
+    if not os.path.exists(p):
+        return out
+    db = sqlite3.connect("file:%s?mode=ro" % p, uri=True)
+    try:
+        cols = ["day", "model", "input", "output", "cache_read", "cache_write"]
+        out["rows"] = [dict(zip(cols, r)) for r in db.execute(
+            "SELECT substr(ts,1,10), model, sum(input), sum(output), sum(cache_read), sum(cache_write) FROM usage "
+            "WHERE repo=? GROUP BY 1,2 ORDER BY 1 DESC LIMIT 400", (rid,))]
+        out["days"] = [dict(zip(["day", "input", "output", "cache_read", "cache_write"], r)) for r in db.execute(
+            "SELECT substr(ts,1,10), sum(input), sum(output), sum(cache_read), sum(cache_write) FROM usage "
+            "WHERE ts >= date('now','-30 day') GROUP BY 1 ORDER BY 1")]
+        out["models"] = [dict(zip(["model", "input", "output", "cache_read"], r)) for r in db.execute(
+            "SELECT model, sum(input), sum(output), sum(cache_read) FROM usage GROUP BY 1 ORDER BY 2 DESC")]
+        out["runs"] = [dict(zip(["run", "input", "output", "cache_read"], r)) for r in db.execute(
+            "SELECT COALESCE(run,'(no run)'), sum(input), sum(output), sum(cache_read) FROM usage WHERE repo=? "
+            "GROUP BY 1 ORDER BY 2 DESC LIMIT 30", (rid,))]
+    finally:
+        db.close()
+    return out
+
+
+# ---------------------------------------------------------------- tools + integrations
+
+def _version(cmd, args=("--version",)):
+    if not C.which(cmd):
+        return None
+    cp = C.run([cmd] + list(args), timeout=20)
+    line = ((cp.stdout or cp.stderr or "").strip().splitlines() or [""])[0]
+    m = re.search(r"\d+\.\d+(\.\d+)?", line)
+    return m.group(0) if m else (line[:40] or "installed")
+
+
+def _http_ok(u, timeout=1.5):
+    try:
+        with urllib.request.urlopen(u, timeout=timeout) as r:
+            return r.status < 500
+    except Exception:
+        return False
+
+
+def _mcp_servers():
+    exe = C.which("claude")
+    if not exe:
+        return {}
+    cp = C.run([exe, "mcp", "list"], timeout=90)
+    out = {}
+    for line in (cp.stdout or "").splitlines():
+        m = re.match(r"^([\w.@/-]+): .* - (.+)$", line.strip())
+        if m:
+            out[m.group(1)] = m.group(2).strip()
+    return out
+
+
+def _headroom_proxy_routed():
+    """Is Claude Code pointed at a local Headroom proxy? Only a yes/no ever leaves this function."""
+    from . import claudecfg as CC
+    from . import headroom as HR
+    return bool(HR.routed() or CC.find(tag=HR.ROUTE_TAG)) and HR.live(timeout=1)
+
+
+def tools():
+    def get():
+        from . import setup as SU
+        from .cli import TOOLS
+        rows = []
+        for cmd, why, pack in TOOLS:
+            rows.append({"tool": cmd, "purpose": why, "pack": pack, "required": SU.pack_on(pack),
+                         "installed": bool(SU.which(cmd))})
+        versions = {t: _version(t) for t in ("code-review-graph", "graphify", "headroom", "ollama", "docker",
+                                              "semgrep", "trivy", "gitleaks", "osv-scanner", "strix", "gh")}
+        versions["omnigraph"] = _version("omnigraph", ("version",))
+        for r in rows:
+            r["version"] = versions.get(r["tool"])
+        mcp = _mcp_servers()
+        gh = C.run(["gh", "auth", "status"], timeout=15).returncode == 0 if C.which("gh") else False
+        pg = C.run(["pgrep", "-qi", "LuLu|Little Snitch"]).returncode == 0
+        integrations = [
+            {"name": "code-review-graph", "kind": "Code graph (MCP)", "ok": bool(versions["code-review-graph"]),
+             "detail": "MCP: provided by the LFG plugin in repos where LFG is on"},
+            {"name": "graphify", "kind": "Architecture graph (CLI)", "ok": bool(versions["graphify"]),
+             "detail": "v%s, graph in <repo>/graphify-out/ (git-ignored)" % versions["graphify"]},
+            {"name": "Omnigraph dev-graph", "kind": "Work + decisions graph", "ok": _og_ready("dev-graph"),
+             "detail": "server %s · Knowledge pack" % ("up" if _og_ready("dev-graph") else "not running"),
+             "optional": not SU.pack_on("knowledge")},
+            {"name": "Omnigraph second-brain", "kind": "Personal knowledge graph", "ok": _og_ready("second-brain"),
+             "detail": "server %s · Knowledge pack" % ("up" if _og_ready("second-brain") else "not running"),
+             "optional": not SU.pack_on("knowledge")},
+            {"name": "Linear", "kind": "Issues (MCP, OAuth)", "ok": "linear" in mcp and "Connected" in mcp["linear"],
+             "detail": "MCP: %s. Sign in with /mcp in Claude Code; the dashboard shows the dev-graph mirror."
+                       % mcp.get("linear", "not registered"), "optional": not SU.pack_on("linear")},
+            {"name": "Headroom", "kind": "Token compression", "ok": bool(versions["headroom"]),
+             "detail": "proxy %s" % ("routing Claude Code" if _headroom_proxy_routed() else "off"),
+             "optional": not SU.pack_on("headroom")},
+            {"name": "GitHub (gh)", "kind": "PR/CI status, read-only", "ok": gh,
+             "detail": "signed in" if gh else "run `gh auth login` yourself"},
+            {"name": "Ollama", "kind": "Local model for /pentest", "ok": _http_ok("http://127.0.0.1:11434/api/tags"),
+             "detail": "only needed for /pentest", "optional": True},
+            {"name": "Egress firewall", "kind": "LuLu / Little Snitch", "ok": pg,
+             "detail": "running" if pg else "not running; /pentest refuses to start without it", "optional": True},
+            {"name": "Docker", "kind": "Ship check, pentest sandbox",
+             "ok": C.run(["docker", "info", "--format", "{{.ServerVersion}}"], timeout=15).returncode == 0
+             if C.which("docker") else False, "detail": "daemon"},
+        ]
+        return {"tools": rows, "integrations": integrations, "mcp": mcp, "checked_at": C.now_iso()}
+    return cached("tools", 300, get)
+
+
+def tools_quick():
+    """Cheap status for the overview (no subprocess-heavy checks)."""
+    hit = _CACHE.get("tools")
+    if hit:
+        return hit[1]["integrations"]
+    return [{"name": "dev-graph", "ok": _og_ready("dev-graph")},
+            {"name": "second-brain", "ok": _og_ready("second-brain")}]
+
+
+# ---------------------------------------------------------------- overview
+
+def _audit(n):
+    try:
+        with open(C.lfg_path("audit.log")) as fh:
+            lines = fh.readlines()[-n:]
+    except OSError:
+        return []
+    out = []
+    for line in reversed(lines):
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            pass
+    return out
+
+
+def graph_state(rid):
+    from . import graphs as G
+    st = C.read_json(C.lfg_path("graphs", rid, "state.json"), {}) or {}
+    root = st.get("repo_root")
+    fresh = None
+    if root and os.path.isdir(root):
+        try:
+            fresh = G.status(root, rid)["status"]
+        except Exception:
+            fresh = None
+    return {"status": fresh or ("error" if st.get("last_error") else "unknown"), "synced_at": st.get("synced_at"),
+            "mode": st.get("mode"), "seconds": st.get("last_sync_s"), "error": st.get("last_error"), "root": root,
+            "docs": D.docs_state(rid)}
+
+
+def overview(rid, branch=None):
+    rs = runs(rid, branch)["runs"]
+    cur = next((r for r in rs if r.get("current")), rs[0] if rs else None)
+    u = usage(rid)
+    week = [d for d in u["days"] if d["day"] >= time.strftime("%Y-%m-%d", time.localtime(time.time() - 7 * 86400))]
+    work = None
+    if _og_ready("dev-graph"):
+        work = {"ready": len(_rows(_inv("dev-graph", "ready"))), "blocked": len(_rows(_inv("dev-graph", "blocked"))),
+                "epics": len(_rows(_inv("dev-graph", "open_epics")))}
+    sec = security(rid, branch)
+    return {
+        "graphs": graph_state(rid), "code": code(rid, full=False), "architecture": architecture(rid, full=False),
+        "run": cur, "runs": len(rs), "work": work,
+        "security": (sec["secure"] or [None])[0] and {k: sec["secure"][0][k] for k in ("run", "verdict", "blocking")},
+        "tokens_7d": {k: sum(d[k] or 0 for d in week) for k in ("input", "output", "cache_read", "cache_write")},
+        "days": u["days"], "headroom": u["headroom"], "spend": u["spend"], "integrations": tools_quick(),
+        "activity": [{k: e.get(k) for k in ("ts", "event", "rule", "tool", "why", "repo_id")} for e in _audit(40)][:15],
+        "playbooks": [os.path.basename(p) for p in sorted(glob.glob(os.path.join(D.playbook_dir(rid), "*.md")))],
+    }

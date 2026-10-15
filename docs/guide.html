@@ -1,0 +1,743 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="author" content="Varun Singh">
+<title>LFG Documentation — Commands and Getting Started</title>
+<style>
+  /* Same palette, fonts and dark mode as the dashboard (lib/lfgcore/ui_assets/app.css). */
+  :root {
+    --bg: #fafafa; --surface: #ffffff; --subtle: #fafafa; --muted-bg: #f4f4f5;
+    --fg: #171717; --fg-2: #525252; --muted: #8a8a8a; --border: #ececec; --border-2: #dcdcdc;
+    --accent: #2563eb; --accent-fg: #ffffff; --accent-soft: #eff4ff; --accent-line: #c7d7fe;
+    --ok: #15803d; --ok-soft: #effaf2; --ok-line: #bbe5c8;
+    --warn: #b45309; --warn-soft: #fff8eb; --warn-line: #f5d9a8;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, "Helvetica Neue", Arial, sans-serif;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --radius: 10px; --header: 60px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0e0e10; --surface: #161618; --subtle: #131315; --muted-bg: #1e1e21;
+      --fg: #ececec; --fg-2: #b4b4b8; --muted: #808086; --border: #26262a; --border-2: #333338;
+      --accent: #7aa2ff; --accent-fg: #0e0e10; --accent-soft: #1a2340; --accent-line: #2f4a85;
+      --ok: #4ade80; --ok-soft: #10261a; --ok-line: #1f5132;
+      --warn: #fbbf24; --warn-soft: #2b2110; --warn-line: #5c4415;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { scroll-padding-top: calc(var(--header) + 16px); }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.65 var(--sans);
+         -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  /* ---------- header ---------- */
+  header.top { position: sticky; top: 0; z-index: 20; height: var(--header); display: flex; align-items: center;
+               gap: 16px; padding: 0 28px; background: color-mix(in srgb, var(--bg) 88%, transparent);
+               backdrop-filter: saturate(180%) blur(8px); border-bottom: 1px solid var(--border); }
+  .logo { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 16px; color: var(--fg); letter-spacing: -0.01em; }
+  .logo-mark { width: 26px; height: 26px; border-radius: 6px; background: var(--accent); color: var(--accent-fg);
+               display: grid; place-items: center; font-size: 12px; font-weight: 800; letter-spacing: 0.02em; }
+  .logo .sep { color: var(--border-2); font-weight: 400; }
+  .logo .section { font-weight: 500; color: var(--muted); }
+  .badge { font-size: 12px; font-weight: 500; color: var(--muted); border: 1px solid var(--border); border-radius: 999px; padding: 1px 9px; }
+  header.top .spacer { flex: 1; }
+  header.top .meta { font-size: 13px; color: var(--muted); }
+
+  /* ---------- layout ---------- */
+  .layout { display: grid; grid-template-columns: 260px minmax(0, 1fr); max-width: 1320px; margin: 0 auto; }
+  aside.side { position: sticky; top: var(--header); height: calc(100vh - var(--header)); overflow-y: auto;
+               padding: 28px 16px 40px 28px; border-right: 1px solid var(--border); }
+  .side .group { margin-bottom: 22px; }
+  .side .group-title { font-size: 12px; font-weight: 600; color: var(--fg); margin: 0 0 6px 10px; }
+  .side a { display: block; font-size: 14px; color: var(--muted); padding: 5px 10px; border-radius: 6px; border-left: 2px solid transparent; }
+  .side a:hover { color: var(--fg); background: var(--muted-bg); text-decoration: none; }
+  .side a.active { color: var(--accent); background: var(--accent-soft); font-weight: 500; }
+  main { padding: 44px 56px 96px; min-width: 0; }
+  .content { max-width: 900px; }
+
+  /* ---------- type ---------- */
+  .eyebrow { font-size: 13px; font-weight: 600; color: var(--accent); margin-bottom: 8px; }
+  h1 { font-size: 36px; line-height: 1.2; margin: 0 0 14px; letter-spacing: -0.025em; font-weight: 700; }
+  h2 { font-size: 24px; line-height: 1.3; margin: 64px 0 8px; letter-spacing: -0.015em; font-weight: 650; }
+  h3 { font-size: 17px; margin: 36px 0 10px; font-weight: 600; }
+  h2 + .desc { margin-top: 0; }
+  p { margin: 10px 0; color: var(--fg-2); }
+  .lead { font-size: 18px; line-height: 1.6; color: var(--muted); max-width: 720px; margin-bottom: 0; }
+  .desc { color: var(--muted); }
+  hr.section { border: 0; border-top: 1px solid var(--border); margin: 56px 0 0; }
+  code { font-family: var(--mono); font-size: 0.86em; background: var(--muted-bg); border: 1px solid var(--border);
+         padding: 1px 5px; border-radius: 4px; color: var(--fg); white-space: nowrap; }
+  .codeblock { position: relative; margin: 12px 0; }
+  pre { font-family: var(--mono); font-size: 13px; line-height: 1.6; background: var(--subtle); border: 1px solid var(--border);
+        border-radius: var(--radius); padding: 14px 16px; margin: 0; overflow-x: auto; color: var(--fg); }
+  pre code { background: none; border: 0; padding: 0; font-size: inherit; white-space: pre; }
+  .copy { position: absolute; top: 8px; right: 8px; font: 500 12px var(--sans); color: var(--muted); background: var(--surface);
+          border: 1px solid var(--border); border-radius: 6px; padding: 3px 9px; cursor: pointer; opacity: 0; transition: opacity .15s; }
+  .codeblock:hover .copy, .copy:focus { opacity: 1; }
+
+  /* ---------- tables ---------- */
+  .table-wrap { border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; margin: 14px 0; overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th { text-align: left; font-size: 12px; font-weight: 600; color: var(--muted); background: var(--subtle);
+       padding: 10px 14px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  td { padding: 12px 14px; border-bottom: 1px solid var(--border); vertical-align: top; color: var(--fg-2); }
+  tr:last-child td { border-bottom: 0; }
+  tbody tr:hover td { background: var(--subtle); }
+  td.cmd { width: 34%; }
+  td.cmd code { font-weight: 500; }
+  td.say { width: 22%; color: var(--muted); font-size: 13px; }
+  td.num { width: 44px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .opts { display: block; margin-top: 6px; font-family: var(--mono); font-size: 12px; color: var(--muted); line-height: 1.5; }
+  .pill { display: inline-block; font-size: 11px; font-weight: 600; padding: 1px 8px; border-radius: 999px; margin-left: 6px;
+          border: 1px solid var(--border); color: var(--muted); vertical-align: 1px; letter-spacing: 0.01em; }
+  .pill.explicit { border-color: var(--accent-line); color: var(--accent); background: var(--accent-soft); }
+  .yes { color: var(--ok); font-weight: 600; } .dash { color: var(--border-2); }
+
+  /* ---------- filter ---------- */
+  .toolbar { display: flex; align-items: center; gap: 12px; margin: 18px 0 4px; }
+  .filter { position: relative; flex: 0 1 360px; }
+  .filter input { width: 100%; font: 14px var(--sans); color: var(--fg); background: var(--surface); border: 1px solid var(--border-2);
+                  border-radius: var(--radius); padding: 8px 12px 8px 34px; outline: none; }
+  .filter input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+  .filter svg { position: absolute; left: 11px; top: 50%; transform: translateY(-50%); color: var(--muted); }
+  .count { font-size: 13px; color: var(--muted); }
+
+  /* ---------- callouts ---------- */
+  .callout { display: grid; grid-template-columns: 20px 1fr; gap: 12px; border: 1px solid var(--accent-line); background: var(--accent-soft);
+             border-radius: var(--radius); padding: 14px 16px; margin: 18px 0; font-size: 14px; }
+  .callout p { margin: 0; color: var(--fg-2); }
+  .callout .title { font-weight: 600; color: var(--fg); margin-bottom: 2px; }
+  .callout svg { color: var(--accent); margin-top: 2px; }
+  .callout.ok { border-color: var(--ok-line); background: var(--ok-soft); } .callout.ok svg { color: var(--ok); }
+  .callout.warn { border-color: var(--warn-line); background: var(--warn-soft); } .callout.warn svg { color: var(--warn); }
+
+  /* ---------- feature grid ---------- */
+  .features { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; margin: 22px 0; }
+  .feature { padding: 18px 20px; border-right: 1px solid var(--border); border-bottom: 1px solid var(--border); background: var(--surface); }
+  .feature:nth-child(3n) { border-right: 0; }
+  .feature:nth-last-child(-n+3) { border-bottom: 0; }
+  .feature h4 { margin: 0 0 4px; font-size: 14px; font-weight: 600; }
+  .feature p { margin: 0; font-size: 13.5px; color: var(--muted); line-height: 1.55; }
+
+  /* ---------- stepper ---------- */
+  .legend { display: flex; gap: 20px; flex-wrap: wrap; font-size: 13px; color: var(--muted); margin: 14px 0 6px; }
+  .legend span { display: inline-flex; align-items: center; gap: 7px; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+  .dot.lfg { background: var(--accent); } .dot.auto { background: var(--muted); } .dot.you { background: transparent; border: 2px solid var(--warn); }
+  ol.steps { list-style: none; margin: 22px 0 0; padding: 0; }
+  ol.steps > li { position: relative; padding: 0 0 30px 52px; }
+  ol.steps > li::before { content: ""; position: absolute; left: 15px; top: 34px; bottom: 2px; width: 2px; background: var(--border); }
+  ol.steps > li:last-child::before { display: none; }
+  .marker { position: absolute; left: 0; top: 0; width: 32px; height: 32px; border-radius: 50%; display: grid; place-items: center;
+            font-size: 13px; font-weight: 700; background: var(--accent); color: var(--accent-fg); }
+  li.auto .marker { background: var(--muted-bg); color: var(--fg-2); border: 1px solid var(--border-2); }
+  li.you .marker { background: var(--surface); color: var(--warn); border: 2px solid var(--warn); }
+  .step-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; min-height: 32px; }
+  .step-head h4 { margin: 0; font-size: 16px; font-weight: 600; }
+  .who { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+  li.you .who { color: var(--warn); } li.lfg .who { color: var(--accent); }
+  ol.steps p { margin: 4px 0 0; font-size: 14px; }
+  ul.checklist { margin: 8px 0 0; padding: 0; list-style: none; font-size: 14px; color: var(--fg-2); }
+  ul.checklist li { padding: 3px 0 3px 24px; position: relative; }
+  ul.checklist li::before { content: ""; position: absolute; left: 2px; top: 9px; width: 12px; height: 12px; border: 1.5px solid var(--border-2); border-radius: 3px; }
+  .options { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-top: 12px; }
+  .option { border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 16px; background: var(--surface); }
+  .option.rec { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
+  .option .label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+  .option.rec .label { color: var(--accent); }
+  .option h5 { margin: 4px 0 6px; font-size: 14px; } .option h5 code { font-size: 13px; }
+  .option p { margin: 0; font-size: 13px; color: var(--muted); line-height: 1.5; }
+
+  /* ---------- diagram ---------- */
+  .figure { border: 1px solid var(--border); border-radius: var(--radius); background: var(--subtle); padding: 20px 16px 12px; margin: 18px 0; overflow-x: auto; }
+  .figure svg { display: block; width: 100%; min-width: 780px; height: auto; }
+  .figcaption { font-size: 13px; color: var(--muted); margin-top: 8px; text-align: center; }
+  svg .box { fill: var(--surface); stroke: var(--border-2); stroke-width: 1; }
+  svg .box.hl { stroke: var(--accent); stroke-width: 1.5; }
+  svg .k { font: 600 10px var(--sans); fill: var(--muted); letter-spacing: 0.08em; }
+  svg .t { font: 600 14px var(--sans); fill: var(--fg); }
+  svg .c { font: 500 12px var(--mono); fill: var(--accent); }
+  svg .o { font: 10.5px var(--mono); fill: var(--muted); }
+  svg .ln { stroke: var(--border-2); stroke-width: 1.5; fill: none; }
+  svg .loop { stroke: var(--muted); stroke-width: 1.25; stroke-dasharray: 4 4; fill: none; }
+  svg .ah { fill: var(--border-2); } svg .ah2 { fill: var(--muted); }
+  svg .cp { fill: var(--warn-soft); stroke: var(--warn-line); }
+  svg .cpt { font: 600 10.5px var(--sans); fill: var(--warn); }
+  svg .note { font: 12px var(--sans); fill: var(--muted); }
+
+  footer { margin-top: 80px; padding-top: 20px; border-top: 1px solid var(--border); font-size: 13px; color: var(--muted);
+           display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
+
+  /* Inside the dashboard's Help page: the dashboard already has the header, so drop ours. */
+  html.embedded { --header: 0px; }
+  html.embedded header.top { display: none; }
+  html.embedded .layout { max-width: none; }
+  html.embedded main { padding: 32px 40px 80px; }
+  @media (max-width: 1000px) {
+    .layout { grid-template-columns: 1fr; } aside.side { display: none; } main { padding: 32px 20px 64px; }
+    .features, .options { grid-template-columns: 1fr; }
+    .feature { border-right: 0 !important; border-bottom: 1px solid var(--border) !important; } .feature:last-child { border-bottom: 0 !important; }
+    td.cmd, td.say { width: auto; } header.top .meta { display: none; }
+  }
+  @media print {
+    header.top, aside.side, .toolbar, .copy { display: none !important; }
+    .layout { grid-template-columns: 1fr; } main { padding: 0; } h2 { break-after: avoid; } tr, .option, ol.steps > li { break-inside: avoid; }
+  }
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="logo"><span class="logo-mark">LFG</span><span>LFG</span><span class="sep">/</span><span class="section">Documentation</span></div>
+  <span class="badge">v0.1.0</span>
+  <div class="spacer"></div>
+  <div class="meta">Engineering pipeline for Claude Code · Varun Singh</div>
+</header>
+
+<div class="layout">
+<aside class="side">
+  <div class="group">
+    <div class="group-title">Getting started</div>
+    <a href="#overview">Overview</a>
+    <a href="#getting-started">First-time setup</a>
+  </div>
+  <div class="group">
+    <div class="group-title">Concepts</div>
+    <a href="#pipeline">How a run works</a>
+    <a href="#lanes">Lanes</a>
+    <a href="#gates">Quality gates</a>
+    <a href="#checkpoints">Approval checkpoints</a>
+  </div>
+  <div class="group">
+    <div class="group-title">Reference</div>
+    <a href="#slash">Slash commands</a>
+    <a href="#cli">CLI commands</a>
+    <a href="#files">Files and folders</a>
+  </div>
+  <div class="group">
+    <div class="group-title">Guides</div>
+    <a href="#recipes">Common tasks</a>
+    <a href="#dashboard">The dashboard</a>
+    <a href="#sharing">Share with your team</a>
+    <a href="#security">Security model</a>
+  </div>
+</aside>
+
+<main>
+<div class="content">
+
+<!-- =========================================================== OVERVIEW -->
+<section id="overview">
+  <div class="eyebrow">Documentation</div>
+  <h1>LFG commands and getting started</h1>
+  <p class="lead">LFG takes an idea or a Linear issue to a reviewed, tested and security-checked change, with the commit message and pull request description written for you. It runs inside Claude Code as slash commands, backed by the <code>lfg</code> command-line tool. LFG never commits, pushes or deploys — the final step is always yours.</p>
+
+  <div class="features">
+    <div class="feature"><h4>Requirements</h4><p><code>/grill</code> interviews you until goals, users, acceptance criteria and non-goals are clear.</p></div>
+    <div class="feature"><h4>Design and planning</h4><p><code>/plan</code> produces a design, ADRs and test-first tickets with dependencies.</p></div>
+    <div class="feature"><h4>Implementation</h4><p><code>/build</code> implements tickets test-first, in parallel git worktrees when there are several.</p></div>
+    <div class="feature"><h4>Verification</h4><p><code>/check</code> fixes lint, type-checks, runs tests and the build, and replays CI locally.</p></div>
+    <div class="feature"><h4>Security</h4><p><code>/secure</code> vets anything new; <code>/pentest</code> runs an offline attack with a local model.</p></div>
+    <div class="feature"><h4>Review</h4><p><code>/expert</code> reviews standards, spec and blast radius, returning approve, changes or block.</p></div>
+    <div class="feature"><h4>Release readiness</h4><p><code>/ship</code> smoke-tests a Docker image, removes it, and writes the commit and PR text.</p></div>
+    <div class="feature"><h4>Knowledge graphs</h4><p>code-review-graph and graphify map the repository and stay in sync before every skill.</p></div>
+    <div class="feature"><h4>Team and personal memory</h4><p>Decisions go to <b>dev-graph</b>, personal notes to <b>second-brain</b>; both run locally.</p></div>
+  </div>
+</section>
+
+<!-- =========================================================== GETTING STARTED -->
+<section id="getting-started">
+  <hr class="section">
+  <h2>First-time setup</h2>
+  <p class="desc">From a new Mac to your first completed change.</p>
+  <div class="legend">
+    <span><i class="dot lfg"></i>Performed by LFG</span>
+    <span><i class="dot auto"></i>Automatic</span>
+    <span><i class="dot you"></i>Requires you</span>
+  </div>
+
+  <ol class="steps">
+    <li class="lfg"><span class="marker">1</span>
+      <div class="step-head"><h4>Run the installer</h4><span class="who">LFG</span></div>
+      <p>It looks at your machine first (read-only), prints exactly what it would change, and changes nothing until you say yes. Core installs only what every LFG repo needs (uv, gh, code-review-graph, graphify), copies LFG to <code>~/.lfg</code>, puts <code>lfg</code> on your PATH and registers the plugin with Claude Code, <b>turned off</b>. Your Claude Code settings, hooks, skills, MCP servers and <code>CLAUDE.md</code> are left alone. Every change outside <code>~/.lfg</code> is recorded, and <code>lfg uninstall</code> undoes it.</p>
+      <div class="codeblock"><pre><code>git clone https://github.com/varun-singhh/lfg.git &amp;&amp; ./lfg/install.sh</code></pre></div>
+    </li>
+    <li class="you"><span class="marker">2</span>
+      <div class="step-head"><h4>Turn LFG on in a repository</h4><span class="who">You</span></div>
+      <p>LFG only works in repos you turn it on for. Everywhere else Claude Code behaves as if LFG weren't installed. You can also do this from <code>lfg ui</code> → Settings → Claude Code.</p>
+      <div class="codeblock"><pre><code>cd your-repo &amp;&amp; lfg enable</code></pre></div>
+    </li>
+    <li class="you"><span class="marker">3</span>
+      <div class="step-head"><h4>Add the packs you want</h4><span class="who">You</span></div>
+      <p>Optional features install their tools only when you ask: <code>security</code> (scanners for <code>/lfg:secure</code>), <code>shipcheck</code> (Docker), <code>pentest</code> (Ollama, Strix, LuLu), <code>knowledge</code> (dev-graph, second-brain), <code>linear</code> and <code>headroom</code>. Add them from the dashboard or the terminal, then check everything with <code>lfg doctor</code>.</p>
+      <div class="codeblock"><pre><code>lfg add security
+lfg doctor</code></pre></div>
+      <ul class="checklist">
+        <li>Run <code>gh auth login</code> if the doctor reports GitHub is not signed in.</li>
+        <li>With the Pentest pack: open LuLu and approve its system extension.</li>
+        <li>With the Linear pack: run <code>/mcp</code> in Claude Code and sign in to Linear.</li>
+      </ul>
+    </li>
+    <li class="you"><span class="marker">4</span>
+      <div class="step-head"><h4>Open Claude Code in that repository</h4><span class="who">You</span></div>
+      <p>The session-start hook confirms that LFG is on. LFG's commands are namespaced: type <code>/lfg:wizard</code>, <code>/lfg:which</code> and so on. The short form (<code>/wizard</code>) works when no other skill has that name.</p>
+      <div class="codeblock"><pre><code>cd your-repo &amp;&amp; claude</code></pre></div>
+    </li>
+    <li class="auto"><span class="marker">5</span>
+      <div class="step-head"><h4>Knowledge graphs are built</h4><span class="who">Automatic</span></div>
+      <p>The first skill you run builds the code-review-graph and graphify graphs for the repository (static analysis only, no API cost) into <code>.code-review-graph/</code> and <code>graphify-out/</code> in the repo. Both are git-ignored, so they are never committed, and one graph serves every branch and worktree. Afterwards, only changes are synced, including uncommitted edits.</p>
+      <p>You never have to manage branches for LFG. When work belongs on another branch, or your checkout holds unrelated changes, the agent creates a worktree on its own next to the repo (<code>&lt;repo&gt;.worktrees/&lt;branch&gt;</code>), works there and tells you where the changes are. It never switches your checkout. Worktrees left clean are removed automatically after a day; any with changes are kept for you to commit.</p>
+    </li>
+    <li class="you"><span class="marker">6</span>
+      <div class="step-head"><h4>Choose how to work</h4><span class="who">You</span></div>
+      <p>If you are unsure, run <code>/which</code> and LFG recommends the next command.</p>
+      <div class="options">
+        <div class="option rec"><div class="label">Recommended first</div><h5><code>/wizard &lt;idea&gt;</code></h5><p>Guided run of every stage with plain-language explanations; failures loop through <code>/fix</code> until all gates pass.</p></div>
+        <div class="option"><div class="label">Automated</div><h5><code>/lfg &lt;idea | LIN-123&gt;</code></h5><p>The same pipeline with less commentary. Selects the lane and pauses only at checkpoints.</p></div>
+        <div class="option"><div class="label">Manual</div><h5>Individual commands</h5><p><code>/grill</code>, <code>/plan</code>, <code>/build</code>, <code>/check</code>, <code>/secure</code>, <code>/expert</code>, <code>/ship</code> — or a single task such as <code>/fix</code>.</p></div>
+      </div>
+    </li>
+    <li class="lfg"><span class="marker">7</span>
+      <div class="step-head"><h4>The pipeline runs</h4><span class="who">LFG</span></div>
+      <p>Each stage writes its output to a run folder under <code>~/.lfg/runs/</code>, so any run can be resumed. LFG pauses at <a href="#checkpoints">checkpoints</a> for your approval. See <a href="#pipeline">How a run works</a>.</p>
+    </li>
+    <li class="you"><span class="marker">8</span>
+      <div class="step-head"><h4>Commit, push and open the pull request</h4><span class="who">You</span></div>
+      <p>Review the unstaged diff, then use the generated commit message and PR description.</p>
+      <div class="codeblock"><pre><code>git commit -F "$(lfg run path COMMIT_MSG.md)"
+git push
+gh pr create --body-file "$(lfg run path PR_BODY.md)"</code></pre></div>
+    </li>
+    <li class="lfg"><span class="marker">9</span>
+      <div class="step-head"><h4>Follow CI and capture learnings</h4><span class="who">LFG</span></div>
+      <p><code>lfg watch</code> follows the CI run (read-only). After the merge, <code>/learn</code> records learnings, principles and playbooks for future runs.</p>
+    </li>
+  </ol>
+</section>
+
+<!-- =========================================================== PIPELINE -->
+<section id="pipeline">
+  <hr class="section">
+  <h2>How a run works</h2>
+  <p class="desc">Stages communicate only through files in the run folder, never through chat history. This keeps token usage low and makes every run resumable with <code>/wizard resume</code> or after <code>/handoff</code>.</p>
+
+  <div class="figure">
+    <svg viewBox="0 0 1000 250" role="img" aria-label="Pipeline stages: grill, lane triage, plan, build, prove, expert review, ship, with a learning loop">
+      <defs>
+        <marker id="a1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="ah" d="M0,0 L10,5 L0,10 z"/></marker>
+        <marker id="a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="ah2" d="M0,0 L10,5 L0,10 z"/></marker>
+      </defs>
+      <!-- checkpoints -->
+      <rect class="cp" x="35" y="10" width="90" height="20" rx="10"/><text class="cpt" x="80" y="24" text-anchor="middle">Checkpoint 1</text>
+      <rect class="cp" x="315" y="10" width="90" height="20" rx="10"/><text class="cpt" x="360" y="24" text-anchor="middle">Checkpoint 2</text>
+      <rect class="cp" x="875" y="10" width="90" height="20" rx="10"/><text class="cpt" x="920" y="24" text-anchor="middle">Checkpoint 5</text>
+      <!-- boxes -->
+      <g>
+        <rect class="box" x="20" y="44" width="120" height="132" rx="8"/>
+        <text class="k" x="80" y="66" text-anchor="middle">TALK</text><text class="t" x="80" y="88" text-anchor="middle">Brief</text>
+        <text class="c" x="80" y="112" text-anchor="middle">/grill</text><text class="o" x="80" y="146" text-anchor="middle">01-brief.md</text>
+      </g>
+      <g>
+        <rect class="box" x="160" y="44" width="120" height="132" rx="8"/>
+        <text class="k" x="220" y="66" text-anchor="middle">LANE</text><text class="t" x="220" y="88" text-anchor="middle">Triage</text>
+        <text class="c" x="220" y="112" text-anchor="middle">lfg lane</text><text class="o" x="220" y="146" text-anchor="middle">progress.md</text>
+      </g>
+      <g>
+        <rect class="box" x="300" y="44" width="120" height="132" rx="8"/>
+        <text class="k" x="360" y="66" text-anchor="middle">PLAN</text><text class="t" x="360" y="88" text-anchor="middle">Design</text>
+        <text class="c" x="360" y="112" text-anchor="middle">/plan</text>
+        <text class="o" x="360" y="140" text-anchor="middle">02-design.md</text><text class="o" x="360" y="155" text-anchor="middle">tasks.json</text>
+      </g>
+      <g>
+        <rect class="box" x="440" y="44" width="120" height="132" rx="8"/>
+        <text class="k" x="500" y="66" text-anchor="middle">BUILD</text><text class="t" x="500" y="88" text-anchor="middle">Implement</text>
+        <text class="c" x="500" y="112" text-anchor="middle">/build</text><text class="o" x="500" y="146" text-anchor="middle">03-build-*.md</text>
+      </g>
+      <g>
+        <rect class="box hl" x="580" y="44" width="120" height="132" rx="8"/>
+        <text class="k" x="640" y="66" text-anchor="middle">PROVE · PARALLEL</text><text class="t" x="640" y="88" text-anchor="middle">QA + Security</text>
+        <text class="c" x="640" y="108" text-anchor="middle">/check</text><text class="c" x="640" y="123" text-anchor="middle">/secure</text>
+        <text class="c" x="640" y="138" text-anchor="middle">/pentest</text>
+        <text class="o" x="640" y="157" text-anchor="middle">04-qa.md</text><text class="o" x="640" y="170" text-anchor="middle">05-*.json</text>
+      </g>
+      <g>
+        <rect class="box" x="720" y="44" width="120" height="132" rx="8"/>
+        <text class="k" x="780" y="66" text-anchor="middle">REVIEW</text><text class="t" x="780" y="88" text-anchor="middle">Expert</text>
+        <text class="c" x="780" y="112" text-anchor="middle">/expert</text><text class="o" x="780" y="146" text-anchor="middle">06-review.json</text>
+      </g>
+      <g>
+        <rect class="box" x="860" y="44" width="120" height="132" rx="8"/>
+        <text class="k" x="920" y="66" text-anchor="middle">SHIP</text><text class="t" x="920" y="88" text-anchor="middle">Packet</text>
+        <text class="c" x="920" y="112" text-anchor="middle">/ship</text>
+        <text class="o" x="920" y="136" text-anchor="middle">07-shipcheck.json</text><text class="o" x="920" y="151" text-anchor="middle">COMMIT_MSG.md</text>
+        <text class="o" x="920" y="166" text-anchor="middle">PR_BODY.md</text>
+      </g>
+      <!-- connectors -->
+      <line class="ln" x1="140" y1="110" x2="158" y2="110" marker-end="url(#a1)"/>
+      <line class="ln" x1="280" y1="110" x2="298" y2="110" marker-end="url(#a1)"/>
+      <line class="ln" x1="420" y1="110" x2="438" y2="110" marker-end="url(#a1)"/>
+      <line class="ln" x1="560" y1="110" x2="578" y2="110" marker-end="url(#a1)"/>
+      <line class="ln" x1="700" y1="110" x2="718" y2="110" marker-end="url(#a1)"/>
+      <line class="ln" x1="840" y1="110" x2="858" y2="110" marker-end="url(#a1)"/>
+      <!-- learning loop -->
+      <path class="loop" d="M920,176 L920,210 L80,210 L80,180" marker-end="url(#a2)"/>
+      <text class="note" x="500" y="234" text-anchor="middle">After merge, /learn feeds learnings and principles into the next run's design and review</text>
+    </svg>
+  </div>
+  <div class="figcaption">Figure 1. Pipeline stages and their outputs. Express and Hotfix lanes skip the planning stage.</div>
+
+  <h3 id="lanes">Lanes</h3>
+  <p>The lane is selected from facts — diff size, graph impact radius and sensitive files — so small changes run fewer stages. Any stage can raise the lane; only you can lower it.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Lane</th><th>Applies when</th><th>Planning</th><th>Pentest</th><th>Target time</th></tr></thead>
+    <tbody>
+      <tr><td><b>Express</b></td><td>Docs, config, copy or CSS only; small impact; no sensitive files</td><td class="dash">—</td><td class="dash">—</td><td>~15 min</td></tr>
+      <tr><td><b>Standard</b></td><td>Moderate impact in one area; no new dependency</td><td class="yes">Yes</td><td>Quick, diff only</td><td>1–2 h</td></tr>
+      <tr><td><b>Full</b></td><td>Wide impact; auth, crypto, PII, payments, migrations or infrastructure; new dependency; a principle or invariant affected</td><td class="yes">Yes</td><td>Standard or deep</td><td>Same day</td></tr>
+      <tr><td><b>Hotfix</b></td><td>Linked to an open incident</td><td class="dash">—</td><td>Quick, diff only</td><td>&lt; 1 h</td></tr>
+    </tbody>
+  </table></div>
+  <div class="callout"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
+    <div><p><code>/secure</code> runs in every lane whenever something new is introduced — a package, URL, container image, CI action, model or MCP server. A blocking finding raises the lane to Full.</p></div></div>
+
+  <h3 id="gates">Quality gates</h3>
+  <p>All eight gates must pass in every lane before a change is ready.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>#</th><th>Requirement</th><th>Verified by</th></tr></thead>
+    <tbody>
+      <tr><td class="num">1</td><td>Build, lint and type-check pass</td><td><code>/check</code>, <code>lfg gate</code></td></tr>
+      <tr><td class="num">2</td><td>Tests for every changed node pass; untested changes are flagged</td><td><code>/check</code></td></tr>
+      <tr><td class="num">3</td><td>Every acceptance criterion maps to at least one test</td><td><code>/check</code></td></tr>
+      <tr><td class="num">4</td><td>No open high or critical pentest findings (Standard and above)</td><td><code>/pentest</code></td></tr>
+      <tr><td class="num">5</td><td>Expert verdict is not <i>block</i>; every requested change is resolved or deferred to an issue</td><td><code>/expert</code></td></tr>
+      <tr><td class="num">6</td><td>AI changes only: evaluation score at or above baseline; cost per call within budget</td><td><code>/build</code></td></tr>
+      <tr><td class="num">7</td><td>No blocking <code>/secure</code> finding in anything new</td><td><code>/secure</code></td></tr>
+      <tr><td class="num">8</td><td>Ship check: the Docker image builds, runs, passes the smoke test and is removed; checklist complete</td><td><code>/ship</code>, <code>lfg shipcheck</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 id="checkpoints">Approval checkpoints</h3>
+  <p>LFG pauses and waits for your decision at these points.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>#</th><th>Decision</th></tr></thead>
+    <tbody>
+      <tr><td class="num">1</td><td>Approve the brief</td></tr>
+      <tr><td class="num">2</td><td>Approve the design, tickets and lane</td></tr>
+      <tr><td class="num">3</td><td>Resolve a blocking security or pentest finding: fix, replace, or accept with a linked issue</td></tr>
+      <tr><td class="num">4</td><td>Resolve an expert-review <i>block</i></td></tr>
+      <tr><td class="num">5</td><td>Review the diff, then commit, push and open the pull request yourself</td></tr>
+      <tr><td class="num">6</td><td>Lower a lane (only you can)</td></tr>
+      <tr><td class="num">7</td><td>Approve any write to Linear, shown as exact text first</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<!-- =========================================================== SLASH -->
+<section id="slash">
+  <hr class="section">
+  <h2>Slash commands</h2>
+  <p class="desc">Run these inside Claude Code, in a repo where LFG is on. Each one's full name is <code>/lfg:&lt;name&gt;</code> (for example <code>/lfg:ship</code>); the short names below work when no other skill uses the same name. If you have your own <code>/ship</code>, <code>/health</code> or <code>/learn</code>, type the full name. Most also trigger from plain language, such as “is it green?” for <code>/check</code>. Commands marked <span class="pill explicit">Explicit</span> run only when typed.</p>
+  <div class="toolbar">
+    <div class="filter"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+      <input type="search" placeholder="Filter slash commands" data-target="slash-body" aria-label="Filter slash commands"></div>
+    <span class="count" data-count="slash-body"></span>
+  </div>
+
+  <div id="slash-body">
+  <h3>Full pipeline</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Command</th><th>Description</th><th>Example prompts</th></tr></thead>
+    <tbody>
+      <tr><td class="cmd"><code>/wizard &lt;idea | LIN-123 | resume&gt;</code><span class="pill explicit">Explicit</span></td><td>Guided end-to-end run of every stage: grill, plan, build, check, secure, pentest, expert, ship check, ship packet and learn. Explains each stage and loops failures through <code>/fix</code> until all eight gates pass (up to three attempts per gate).</td><td class="say">“walk me through everything”</td></tr>
+      <tr><td class="cmd"><code>/lfg &lt;idea | LIN-123&gt;</code><span class="pill explicit">Explicit</span></td><td>The full pipeline in compact form. Selects the lane, delegates each stage to a role agent and pauses only at checkpoints.</td><td class="say">“take this from idea to PR”</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Pipeline stages</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Command</th><th>Description</th><th>Example prompts</th></tr></thead>
+    <tbody>
+      <tr><td class="cmd"><code>/grill</code></td><td>Interviews you one question at a time, informed by the code graphs, until goals, users, acceptance criteria and non-goals are clear. Records glossary terms and ADRs outside the repository and writes <code>01-brief.md</code>.</td><td class="say">“grill me”, “poke holes in this”</td></tr>
+      <tr><td class="cmd"><code>/plan</code></td><td>Produces a graph-scoped design, spec and tracer-bullet tickets with dependencies, owners and test seams in <code>tasks.json</code>, and suggests a lane. Proposes Linear issues for approval.</td><td class="say">“plan this”, “make tickets”</td></tr>
+      <tr><td class="cmd"><code>/build</code></td><td>Implements tickets test-first. A single ticket runs in the working tree; several run in parallel worktrees and are applied as patches in dependency order. Never commits.</td><td class="say">“build it”, “do the tickets”</td></tr>
+      <tr><td class="cmd"><code>/fix</code></td><td>Builds a pass/fail loop, reproduces the problem, finds the root cause, adds a regression test and fixes it. Uses the Hotfix lane for incidents and records a learning.</td><td class="say">“it’s broken”, “why is X failing?”</td></tr>
+      <tr><td class="cmd"><code>/check</code></td><td>Runs the quality gate: fixes lint without suppressions, type-checks, runs affected and full tests, builds as CI does, replays CI locally and reads GitHub CI status.</td><td class="say">“is it green?”, “will CI pass?”</td></tr>
+      <tr><td class="cmd"><code>/secure</code></td><td>Checks everything new — packages, URLs, images, CI actions, models, MCP servers — and security-sensitive code, using local scanners, public vulnerability metadata only, and Cloudflare’s security-audit method for the code review. <code>/secure audit</code> runs Cloudflare’s full audit, only when you ask, after you agree a budget.</td><td class="say">“is this safe?”, “can I add &lt;package&gt;?”</td></tr>
+      <tr><td class="cmd"><code>/pentest</code><span class="pill explicit">Explicit</span></td><td>Offline Strix penetration test of the local app with a local Ollama model. Refuses to start unless Ollama, the model, Docker, the sandbox image and an egress firewall are ready. Writes <code>05-pentest.json</code>.</td><td class="say">“pentest it”</td></tr>
+      <tr><td class="cmd"><code>/expert</code></td><td>Reviews the change on three axes — standards, spec and blast radius (graph impact, principles, invariants) — and returns approve, changes or block.</td><td class="say">“review this”, “what could this break?”</td></tr>
+      <tr><td class="cmd"><code>/ship</code></td><td>Re-runs the gate, runs the Docker ship check and shipping checklist, then writes <code>COMMIT_MSG.md</code> and <code>PR_BODY.md</code>. Never commits, pushes or deploys.</td><td class="say">“ship it”, “ready for a PR”</td></tr>
+      <tr><td class="cmd"><code>/learn</code></td><td>Retrospective on a run or a week: dev-graph learnings and principles, repository playbooks, second-brain notes and proposed reviewer-rule changes.</td><td class="say">“retro”, “what did we learn?”</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Utilities</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Command</th><th>Description</th><th>Example prompts</th></tr></thead>
+    <tbody>
+      <tr><td class="cmd"><code>/which</code></td><td>Reviews graph status, the current run, git and Linear, then recommends the single next command and why.</td><td class="say">“what now?”, “where was I?”</td></tr>
+      <tr><td class="cmd"><code>/explain</code></td><td>Answers questions about the code from the graphs first, opening only the files they point to.</td><td class="say">“how does X work?”</td></tr>
+      <tr><td class="cmd"><code>/impact</code></td><td>Shows the blast radius of the diff or a symbol: callers, dependents, affected flows and covering tests.</td><td class="say">“who calls X?”, “what does this touch?”</td></tr>
+      <tr><td class="cmd"><code>/research</code></td><td>A background agent reads primary sources (official docs, specs, source code) and writes a cited note to the run folder.</td><td class="say">“find the official docs on…”</td></tr>
+      <tr><td class="cmd"><code>/spike</code></td><td>Builds a throwaway prototype to answer one design question, then deletes it and keeps only the conclusion.</td><td class="say">“would this approach work?”</td></tr>
+      <tr><td class="cmd"><code>/map &lt;epic | map-id&gt;</code><span class="pill explicit">Explicit</span></td><td>Breaks an epic too large for one session into decision tickets in dev-graph and resolves one per session.</td><td class="say">“/map migrate auth to JWT”</td></tr>
+      <tr><td class="cmd"><code>/inbox</code></td><td>Imports new Linear issues (read-only) into dev-graph and proposes a triage state for each. Changes to Linear require approval.</td><td class="say">“what’s ready to work on?”</td></tr>
+      <tr><td class="cmd"><code>/health</code></td><td>Finds shallow modules, leaky seams and hard-to-test areas and renders an HTML report for <code>lfg ui</code>.</td><td class="say">“what should we refactor?”</td></tr>
+      <tr><td class="cmd"><code>/note</code></td><td>Saves something worth remembering: a team decision, gotcha, invariant or follow-up to dev-graph, or a personal preference, insight or person to your second-brain. It always asks which graph first. Sessions also offer this on their own when you state a decision or a fix uncovers a root cause, and nothing is saved until you choose.</td><td class="say">“remember that…”</td></tr>
+      <tr><td class="cmd"><code>/handoff</code></td><td>Writes a handoff note and updates <code>progress.md</code> so a new session can continue where you left off.</td><td class="say">“wrap up for today”</td></tr>
+    </tbody>
+  </table></div>
+  </div>
+
+  <div class="callout"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
+    <div><p class="title">Role agents</p><p>Commands delegate work to eight specialised agents: product-manager, architecture-designer, software-engineer, ai-engineer, qa, security-analyst, expert-review and lane-triage. You do not invoke them directly.</p></div></div>
+</section>
+
+<!-- =========================================================== CLI -->
+<section id="cli">
+  <hr class="section">
+  <h2>CLI commands</h2>
+  <p class="desc">Run <code>lfg</code> in a terminal; repository commands must run inside a git repository. Exit codes: <code>0</code> success, <code>1</code> a check failed, <code>2</code> usage or environment error. Most commands accept <code>--json</code>. Slash commands call these for you; day to day you will mainly use <code>doctor</code>, <code>ui</code>, <code>watch</code>, <code>run path</code> and <code>omnigraph status</code>.</p>
+  <div class="toolbar">
+    <div class="filter"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+      <input type="search" placeholder="Filter CLI commands" data-target="cli-body" aria-label="Filter CLI commands"></div>
+    <span class="count" data-count="cli-body"></span>
+  </div>
+
+  <div id="cli-body">
+  <h3>Setup and diagnostics</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Command</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td class="cmd"><code>lfg setup</code><span class="opts">[--packs a,b] [--here] [--dry-run] [--yes]</span></td><td>Installs or updates LFG. Looks first, prints the plan, applies it only after you agree, and offers to clean up what older LFG versions changed machine-wide. <code>./install.sh</code> runs it.</td></tr>
+      <tr><td class="cmd"><code>lfg enable</code> / <code>lfg disable</code><span class="opts">[path] [--hardened] [--everywhere]</span></td><td>Turns LFG on or off for one repo (Claude Code's own per-repo plugin setting in <code>.claude/settings.local.json</code>). <code>disable</code> undoes exactly what <code>enable</code> changed; graphs and runs are kept.</td></tr>
+      <tr><td class="cmd"><code>lfg add</code> / <code>lfg remove</code> <code>&lt;pack&gt;</code></td><td>Adds or switches off an optional pack: security, shipcheck, pentest, knowledge, linear, headroom. <code>lfg packs</code> lists them.</td></tr>
+      <tr><td class="cmd"><code>lfg changes</code><span class="opts">[undo &lt;id&gt;]</span></td><td>Lists every change LFG made outside <code>~/.lfg</code>; <code>undo</code> reverts one, but only if it is still what LFG wrote.</td></tr>
+      <tr><td class="cmd"><code>lfg uninstall</code><span class="opts">[--dry-run] [--keep-data]</span></td><td>Undoes every recorded change, cleans up older installs and removes <code>~/.lfg</code>. Tools installed with Homebrew or uv are listed, not removed.</td></tr>
+      <tr><td class="cmd"><code>lfg version</code></td><td>Prints the version.</td></tr>
+      <tr><td class="cmd"><code>lfg doctor</code><span class="opts">[--selftest]</span></td><td>Checks the tools of the packs you use, where LFG is on, Docker, the Omnigraph graphs, GitHub sign-in, the plugin, leftovers from older installs and a Headroom proxy that is down. <code>--selftest</code> verifies that every forbidden action is blocked.</td></tr>
+      <tr><td class="cmd"><code>lfg init</code><span class="opts">[--rebuild]</span></td><td>First-time setup for the current repository (graphs and folders). Normally automatic.</td></tr>
+      <tr><td class="cmd"><code>lfg omnigraph status</code><span class="opts">[--json]</span></td><td>Shows the installed version and, for dev-graph and second-brain, whether each is created, managed by launchd and ready.</td></tr>
+      <tr><td class="cmd"><code>lfg omnigraph setup</code><span class="opts">[--no-launchd]</span></td><td>Creates both graphs without sample data, generates local access tokens (never displayed) and serves each on 127.0.0.1 under launchd. The plugin brings their MCP servers, only in LFG repos. <code>lfg add knowledge</code> runs this.</td></tr>
+      <tr><td class="cmd"><code>lfg omnigraph restart &lt;name&gt;</code></td><td>Restarts the <code>dev-graph</code> or <code>second-brain</code> server.</td></tr>
+      <tr><td class="cmd"><code>lfg headroom status</code><span class="opts">[--json]</span></td><td>Shows whether Claude Code goes through the local Headroom proxy and where the proxy forwards.</td></tr>
+      <tr><td class="cmd"><code>lfg headroom setup</code><span class="opts">[--scope repos|everywhere] [--upstream URL]</span></td><td>Optional, off by default. Runs the Headroom proxy on 127.0.0.1:8787 under launchd and points Claude Code at it, only in LFG repos unless you choose everywhere, forwarding to the endpoint you used before. Only switches once the proxy answers; refused on Bedrock and Vertex.</td></tr>
+      <tr><td class="cmd"><code>lfg headroom off</code></td><td>Undoes exactly the routing LFG set and stops the proxy. <code>lfg headroom restart</code> restarts it.</td></tr>
+      <tr><td class="cmd"><code>lfg omnigraph serve | mcp &lt;name&gt;</code>, <code>lfg mcp &lt;name&gt;</code></td><td>Internal entry points used by launchd and by the plugin's MCP servers.</td></tr>
+      <tr><td class="cmd"><code>lfg vendor</code><span class="opts">status | sync | update</span></td><td>Manages the pinned upstream skills source.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Knowledge graphs</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Command</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td class="cmd"><code>lfg graphs ensure</code><span class="opts">[--background] [--allow-stale] [--rebuild] [--json] [--quiet]</span></td><td>Builds the graphs on first use and syncs them when code changes, including uncommitted edits. Runs before every command.</td></tr>
+      <tr><td class="cmd"><code>lfg graphs status</code><span class="opts">[--json]</span></td><td>Reports <code>fresh</code>, <code>syncing</code>, <code>stale</code> or <code>missing</code> without changing anything.</td></tr>
+      <tr><td class="cmd"><code>lfg graphs docs</code><span class="opts">[--quiet]</span></td><td>Regenerates the graphify wiki and call-flow view, the code-review-graph wiki and the playbooks. Runs by itself in the background after the graphs change; no AI calls, no network.</td></tr>
+      <tr><td class="cmd"><code>lfg playbooks</code></td><td>Writes the onboarding tour, landmines, test-gap and incident playbooks for this repo. Read them in <code>lfg ui</code> under <em>Docs &amp; playbooks</em>.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Runs and repository</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Command</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td class="cmd"><code>lfg run new &lt;slug&gt;</code></td><td>Creates a run folder, makes it current and prints its path.</td></tr>
+      <tr><td class="cmd"><code>lfg run path</code><span class="opts">[&lt;file&gt;]</span></td><td>Prints the current run folder or a file within it, for example <code>lfg run path PR_BODY.md</code>.</td></tr>
+      <tr><td class="cmd"><code>lfg run list</code></td><td>Lists recent runs for the repository.</td></tr>
+      <tr><td class="cmd"><code>lfg run set</code><span class="opts">[lane=…] [stage=…] [issue=…] [--force]</span></td><td>Records the run's lane, stage and issue (shown on Overview and Runs). A stage also moves the linked issue's status in dev-graph. Lanes only go up unless you pass <code>--force</code>.</td></tr>
+      <tr><td class="cmd"><code>lfg issue sync</code><span class="opts">&lt;ID | title&gt; [--title] [--type] [--status] [--priority]</span></td><td>Adds or updates the issue in dev-graph so it shows on Issues · Linear. <code>/lfg</code>, <code>/wizard</code> and <code>/fix</code> run it at the start of every run.</td></tr>
+      <tr><td class="cmd"><code>lfg repo id</code></td><td>Prints the repository identifier.</td></tr>
+      <tr><td class="cmd"><code>lfg repo root</code> / <code>lfg repo graph</code></td><td>Prints the main checkout / its graphify graph, also from a worktree.</td></tr>
+      <tr><td class="cmd"><code>lfg worktree new &lt;branch&gt;</code><span class="opts">[--from &lt;ref&gt;] · list · remove &lt;name&gt;</span></td><td>Used by agents on their own (you don't need to run it). Checks a branch out in <code>&lt;repo&gt;.worktrees/&lt;branch&gt;</code> next to the repo, without touching your checkout, sharing the repo's graphs. <code>remove</code> refuses a worktree with uncommitted changes and keeps the branch.</td></tr>
+      <tr><td class="cmd"><code>lfg repo docs</code></td><td>Prints the repository’s documentation folder (glossary and ADRs), kept outside the repository.</td></tr>
+      <tr><td class="cmd"><code>lfg rule &lt;name&gt;</code></td><td>Prints a rule module: <code>tdd-rules</code>, <code>slice-rules</code>, <code>domain-docs</code>, <code>module-design</code>, <code>bug-loop</code>, <code>agent-writing</code>, <code>git-guard</code> or <code>graph-first</code>.</td></tr>
+      <tr><td class="cmd"><code>lfg lane</code><span class="opts">[--json]</span></td><td>Suggests a lane from the diff and graph impact, with reasons.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Verification and release</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Command</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td class="cmd"><code>lfg gate</code><span class="opts">[--fix] [--affected] [--only lint,types,test,build,secrets,suppressions] [--json]</span></td><td>Runs lint, type-check, tests, build, a secret scan and a check for new lint suppressions. <code>--fix</code> runs the formatter first; <code>--affected</code> limits tests to impacted files. Writes <code>ready.json</code>.</td></tr>
+      <tr><td class="cmd"><code>lfg ci-local</code><span class="opts">[--list] [--json]</span></td><td>Replays lint, type, test and build steps from <code>.github/workflows</code> locally, and lints the workflows.</td></tr>
+      <tr><td class="cmd"><code>lfg secure</code><span class="opts">[diff | all | &lt;pkg@ver&gt; | &lt;url&gt; | &lt;image&gt;] [--offline] [--json]</span></td><td>Runs local scanners and public vulnerability lookups. Exits 1 on a blocking finding.</td></tr>
+      <tr><td class="cmd"><code>lfg pentest</code><span class="opts">[--target &lt;local-url&gt;] [--mode quick | standard | deep] [--model &lt;name&gt;] [--preflight] [--json]</span></td><td>Runs Strix with a local Ollama model on a scrubbed copy of the repository; local targets only. <code>--preflight</code> reports readiness and what is missing.</td></tr>
+      <tr><td class="cmd"><code>lfg shipcheck</code><span class="opts">[--cleanup] [--json]</span></td><td>Docker build, scan, run on an isolated network, smoke test, removal and cleanup verification, plus the shipping checklist.</td></tr>
+      <tr><td class="cmd"><code>lfg watch</code></td><td>Follows the CI run for the current branch through <code>gh</code> (read-only).</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Dashboard and feedback</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Command</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td class="cmd"><code>lfg ui</code><span class="opts">[--port 7777] [--unlock]</span></td><td>Opens the dashboard at <code>http://127.0.0.1:7777</code> (pick the project and branch at the top of the side menu). It is written in plain words, and every run, task, failed check and finding says what it is about; click one for the details, never raw JSON: <em>Home</em> says what is being worked on, the next step and what needs you; then Runs, Issues, Checks (review, security, ship check), Code, Docs, Knowledge (decisions, lessons, code rules, your notes), Usage and Help. Under <em>Settings</em> you can change LFG settings, see and pull local Ollama models for pentests (cloud models are refused), edit the LFG skills and your global CLAUDE.md, see what LFG uses on disk and delete old branches' runs once it passes your limit (500 MB by default; graphs inside your repos are shown but not counted), read every rule LFG follows (hover any rule number anywhere to see what it means), change the rule guides agents read or add your own in Markdown (the 18 safety rules stay fixed), and build or refresh a project's code map from the side menu (<code>--unlock</code> re-opens it with editing on).</td></tr>
+      <tr><td class="cmd"><code>lfg feedback add &lt;finding-id&gt; accept | reject</code><span class="opts">[--note "…"]</span></td><td>Records your verdict on a review finding to tune the reviewer.</td></tr>
+      <tr><td class="cmd"><code>lfg usage</code><span class="opts">[--json]</span></td><td>Summarises token usage and time.</td></tr>
+      <tr><td class="cmd"><code>lfg hook &lt;event&gt;</code></td><td>Internal Claude Code hook entry points.</td></tr>
+    </tbody>
+  </table></div>
+  </div>
+</section>
+
+<!-- =========================================================== FILES -->
+<section id="files">
+  <hr class="section">
+  <h2>Files and folders</h2>
+  <p class="desc">LFG adds only its two git-ignored graph folders to your repositories. Everything else is stored in <code>~/.lfg</code> (mode 700) on your machine, with a 500 MB limit you can change under Settings → Disk space.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Location</th><th>Contents</th></tr></thead>
+    <tbody>
+      <tr><td class="cmd"><code>~/.lfg/runs/&lt;repo-id&gt;/&lt;run-id&gt;/</code></td><td>Run outputs: <code>01-brief.md</code> to <code>07-shipcheck.json</code>, <code>tasks.json</code>, <code>progress.md</code>, <code>COMMIT_MSG.md</code>, <code>PR_BODY.md</code></td></tr>
+      <tr><td class="cmd"><code>&lt;repo&gt;/.code-review-graph/</code>, <code>&lt;repo&gt;/graphify-out/</code></td><td>code-review-graph and graphify data (git-ignored; one graph for every branch and worktree)</td></tr>
+      <tr><td class="cmd"><code>~/.lfg/graphs/&lt;repo-id&gt;/</code></td><td>Graph sync state, lock and log</td></tr>
+      <tr><td class="cmd"><code>~/.lfg/repos/&lt;repo-id&gt;/docs/</code></td><td>Glossary and architecture decision records</td></tr>
+      <tr><td class="cmd"><code>~/.lfg/omnigraph/</code></td><td>dev-graph and second-brain data and server logs</td></tr>
+      <tr><td class="cmd"><code>~/.lfg/config.json</code></td><td>Settings: models per role, lanes, pentest model, ports, Linear team</td></tr>
+      <tr><td class="cmd"><code>~/.lfg/plugin/</code></td><td>Skills, agents, rules and hooks loaded by Claude Code</td></tr>
+      <tr><td class="cmd"><code>~/.lfg/audit.log</code></td><td>Record of blocked actions and security events</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<!-- =========================================================== RECIPES -->
+<section id="recipes">
+  <hr class="section">
+  <h2>Common tasks</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Goal</th><th>Command</th></tr></thead>
+    <tbody>
+      <tr><td>Build a new feature for the first time</td><td><code>/wizard add CSV export to the reports page</code></td></tr>
+      <tr><td>Work on a Linear issue</td><td><code>/lfg LIN-123</code></td></tr>
+      <tr><td>Fix a bug</td><td>Describe it, for example “the login test fails with 401” → <code>/fix</code>, then <code>/check</code> and <code>/ship</code></td></tr>
+      <tr><td>Vet a dependency before adding it</td><td><code>/secure</code> or <code>lfg secure left-pad@1.3.0</code></td></tr>
+      <tr><td>Assess the risk of a change</td><td><code>/impact</code>, then <code>/expert</code></td></tr>
+      <tr><td>Understand an unfamiliar codebase</td><td><code>/explain how does billing work?</code> and <code>lfg ui</code></td></tr>
+      <tr><td>Stop and resume later</td><td><code>/handoff</code>; next session <code>/which</code> or <code>/wizard resume</code></td></tr>
+      <tr><td>Troubleshoot the setup</td><td><code>lfg doctor</code>, <code>lfg graphs status</code>, <code>lfg omnigraph status</code></td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<!-- =========================================================== SECURITY -->
+<section id="dashboard">
+  <hr class="section">
+  <h2>The dashboard</h2>
+  <p class="desc"><code>lfg ui</code> opens one read-only page for everything LFG and its tools know, at <code>http://127.0.0.1:7777</code>. It listens on your machine only. Everything is read-only except <em>Settings</em>, which only the browser that <code>lfg ui</code> opened can save. Pick a project at the top; the code map refreshes on its own, and you can build or refresh it yourself from the side menu or the Code page.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Page</th><th>What you see there</th></tr></thead>
+    <tbody>
+      <tr><td>Overview</td><td>Current run, open issues, latest review and security verdicts, risky files, integration health.</td></tr>
+      <tr><td>Runs</td><td>Every run with its stages; open any run file (brief, design, QA, review, ship check).</td></tr>
+      <tr><td>Issues</td><td>Your Linear issues, mirrored into the local dev graph.</td></tr>
+      <tr><td>Reviews / Security</td><td>Review findings with your accept/reject feedback; scanner, pentest and ship-check results.</td></tr>
+      <tr><td>Code graph</td><td>From code-review-graph: hubs, bridges, risky changes, flows, communities, large functions.</td></tr>
+      <tr><td>Architecture</td><td>From graphify: god nodes, surprising connections, the call-flow view and the full report.</td></tr>
+      <tr><td>Docs &amp; playbooks</td><td>Generated wikis and the onboarding, landmines, test-gap and incident playbooks.</td></tr>
+      <tr><td>Arch health</td><td>The <code>/health</code> report: shallow modules, leaky seams, hard-to-test areas.</td></tr>
+      <tr><td>Dev graph / Second brain</td><td>Principles, invariants, decisions and learnings LFG uses in design and review.</td></tr>
+      <tr><td>Usage &amp; tokens</td><td>Dollars spent today, this week and this month and by model (worked out by tokensave from Claude Code's logs, at API prices), tokens per day and model, cache hits and what Headroom saved.</td></tr>
+      <tr><td>Tools &amp; integrations</td><td>Status of every CLI tool and MCP server, with the fix for anything missing.</td></tr>
+      <tr><td>Skills</td><td>Every skill Claude Code loads on this computer (yours, the project's and every plugin's), with name clashes flagged, how much context their descriptions cost, a switch for whether Claude may use each one on its own, and the editor for LFG's skills.</td></tr>
+      <tr><td>Settings → Claude Code</td><td>Which repos LFG is on in, feature packs (add or turn off), hardened mode, Headroom scope, the MCP servers LFG brings, your own setup (read-only), leftovers from older versions, and every change LFG made outside <code>~/.lfg</code> with Undo.</td></tr>
+      <tr><td>Help &amp; guide</td><td>This guide, every skill and agent in your install, the CLI reference and the sharing guide.</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="sharing">
+  <hr class="section">
+  <h2>Share with your team</h2>
+  <p class="desc">LFG is open source: everyone installs it from the repository, and each person decides which repos it runs in. The plugin's skills and hooks call the <code>lfg</code> CLI, which ships inside the plugin, so install with <code>install.sh</code> rather than adding the plugin alone.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Step</th><th>Command</th></tr></thead>
+    <tbody>
+      <tr><td>Install</td><td><code>git clone https://github.com/varun-singhh/lfg.git &amp;&amp; ./lfg/install.sh</code></td></tr>
+      <tr><td>Turn on in a repo</td><td><code>lfg enable</code> (each person, per repo)</td></tr>
+      <tr><td>Update</td><td><code>cd lfg &amp;&amp; git pull &amp;&amp; ./install.sh</code> (your skill and rule edits are kept)</td></tr>
+      <tr><td>Remove</td><td><code>lfg uninstall</code></td></tr>
+    </tbody>
+  </table></div>
+  <div class="callout"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
+    <div><p class="title">Nothing personal is shared</p><p>Tokens, graphs, runs and settings are created on each machine under <code>~/.lfg</code>; never share that folder. The full steps, requirements and team settings are in <code>docs/sharing.md</code> and in <code>lfg ui</code> → Help → Share LFG.</p></div></div>
+</section>
+
+<section id="security">
+  <hr class="section">
+  <h2>Security model</h2>
+  <p class="desc">These rules are enforced by the plugin’s hooks, not only requested. <code>lfg doctor --selftest</code> verifies them.</p>
+  <div class="callout warn"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v4M12 17h.01"/><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>
+    <div><p class="title">LFG never</p><p>Commits, pushes, merges, deploys or writes to GitHub; reads <code>.env</code> files, keys or credential stores; writes a secret anywhere; pentests anything that is not local; or sends code to a cloud model during a pentest.</p></div></div>
+  <div class="callout ok"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6 9 17l-5-5"/></svg>
+    <div><p class="title">You always</p><p>Approve briefs, designs and Linear writes; commit and push; and complete anything that needs a password or a system prompt, such as GitHub sign-in, LuLu approval and Linear sign-in.</p></div></div>
+</section>
+
+<footer>
+  <span>LFG v0.2.0 · Varun Singh · MIT</span>
+  <span>Full reference: <code>~/.lfg/CONTRACT.md</code></span>
+</footer>
+
+</div>
+</main>
+</div>
+
+<script>
+  if (window.self !== window.top) document.documentElement.classList.add("embedded");
+  // Sidebar: smooth scrolling and active section.
+  var links = Array.prototype.slice.call(document.querySelectorAll(".side a"));
+  links.forEach(function (a) {
+    a.addEventListener("click", function (e) {
+      var el = document.getElementById(a.getAttribute("href").slice(1));
+      if (el) { e.preventDefault(); el.scrollIntoView({ behavior: "smooth", block: "start" }); }
+    });
+  });
+  var targets = links.map(function (a) { return document.getElementById(a.getAttribute("href").slice(1)); });
+  function setActive() {
+    var y = window.scrollY + 120, idx = 0;
+    targets.forEach(function (t, i) { if (t && t.getBoundingClientRect().top + window.scrollY <= y) idx = i; });
+    links.forEach(function (a, i) { a.classList.toggle("active", i === idx); });
+  }
+  window.addEventListener("scroll", setActive, { passive: true }); setActive();
+
+  // Copy buttons on code blocks.
+  document.querySelectorAll(".codeblock").forEach(function (b) {
+    var btn = document.createElement("button"); btn.className = "copy"; btn.type = "button"; btn.textContent = "Copy";
+    btn.addEventListener("click", function () {
+      var text = b.querySelector("code").innerText;
+      (navigator.clipboard ? navigator.clipboard.writeText(text) : Promise.reject()).then(function () {
+        btn.textContent = "Copied"; setTimeout(function () { btn.textContent = "Copy"; }, 1400);
+      }).catch(function () { btn.textContent = "Select and copy"; });
+    });
+    b.appendChild(btn);
+  });
+
+  // Table filters.
+  document.querySelectorAll(".filter input").forEach(function (box) {
+    var root = document.getElementById(box.dataset.target);
+    var counter = document.querySelector('[data-count="' + box.dataset.target + '"]');
+    function apply() {
+      var q = box.value.trim().toLowerCase(), total = 0, shown = 0;
+      root.querySelectorAll(".table-wrap").forEach(function (w) {
+        var visible = 0;
+        w.querySelectorAll("tbody tr").forEach(function (r) {
+          total++;
+          var hit = !q || r.textContent.toLowerCase().indexOf(q) !== -1;
+          r.style.display = hit ? "" : "none";
+          if (hit) { visible++; shown++; }
+        });
+        w.style.display = visible ? "" : "none";
+        var h = w.previousElementSibling;
+        if (h && h.tagName === "H3") h.style.display = visible ? "" : "none";
+      });
+      counter.textContent = q ? shown + " of " + total + " commands" : total + " commands";
+    }
+    box.addEventListener("input", apply); apply();
+  });
+</script>
+</body>
+</html>

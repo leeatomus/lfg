@@ -1,0 +1,16 @@
+#!/usr/bin/env -S python3 -S
+"""LFG command line. Standard library only, so it starts with -S: no site-packages, which keeps hooks fast whatever
+Python environment is first on PATH."""
+import os
+import sys
+
+sys.dont_write_bytecode = True
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(HERE), "lib"))
+
+if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "hook":  # hot path: skip the argument parser
+        from lfgcore import hooks
+        sys.exit(hooks.main(sys.argv[2]))
+    from lfgcore.cli import main
+    sys.exit(main())
