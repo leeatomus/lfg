@@ -136,6 +136,9 @@ def session_start(data):
     from . import graphs as G
     root, rid = _repo(data)
     lines = [CONTEXT[0] % C.VERSION] + CONTEXT[1:]
+    if C.config()["guard"].get("allow_commit") is True:
+        lines[0] = lines[0].replace("never commit/push/gh-write", "commit only when the user asks (never --amend), "
+                                    "never push/gh-write").replace("; leave changes unstaged", "")
     try:
         from . import settings as S
         own = S.own_rules()

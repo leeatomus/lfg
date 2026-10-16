@@ -41,6 +41,18 @@ class GuardTest(unittest.TestCase):
                     "bash -c 'git push'", "echo $(git push)"):
             self.assertIsNotNone(bash(cmd), cmd)
 
+    def test_allow_commit_lets_commit_through_and_nothing_else(self):
+        C.write_json(C.lfg_path("config.json"), {"guard": {"allow_commit": True}})
+        try:
+            self.assertIsNone(bash("git commit -m x"))
+            self.assertIsNone(bash("cd sub && git commit -F msg.txt"))
+            for cmd in ("git commit --amend -m x", "git commit --no-verify -m x", "git push", "git merge main",
+                        "git rebase main", "git reset --hard"):
+                self.assertIsNotNone(bash(cmd), cmd)
+        finally:
+            os.remove(C.lfg_path("config.json"))
+        self.assertIsNotNone(bash("git commit -m x"))
+
     def test_allows_read_only_git(self):
         for cmd in ("git status", "git diff --stat", "git log -5", "git reset -- app.py"):
             self.assertIsNone(bash(cmd), cmd)

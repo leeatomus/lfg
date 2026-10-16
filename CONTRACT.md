@@ -21,7 +21,8 @@ After install (`~/.lfg`, mode 700):
 ├── state/ledger.json       # every change LFG made outside ~/.lfg (claudecfg.py), what `lfg uninstall` replays
 ├── state/{packs.json,gh.json,usage-offsets.json}
 ├── config.json             # user config, mode 600 (models, lanes, shipcheck, pentest, ports, linear, graphs.docs,
-│                           # headroom.port/mode/scope, guard.hardened)
+│                           # headroom.port/mode/scope, guard.hardened,
+│                           # guard.allow_commit: local commits allowed, not --amend; push/merge stay blocked)
 ├── overrides/{skills,rules}/  defaults/skills/  backups/   # your dashboard edits, pristine copies, backups
 ├── graphs/<repo-id>/{state.json,docs.json,.lock,sync.log}  # graph bookkeeping only; the graphs are in the repo (below)
 ├── repos/<repo-id>/{docs/GLOSSARY.md,docs/adr/,commands.json,shipcheck.json}

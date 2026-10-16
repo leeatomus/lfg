@@ -287,6 +287,13 @@ DEPLOY = [
 LFG_DOCKER_NAME = re.compile(r"^(lfg-shipcheck|lfg-pentest|lfg-strix)[-/:_.a-z0-9]*$", re.I)
 
 
+def _commit_allowed():
+    """`guard.allow_commit` in ~/.lfg/config.json: local commits (not --amend) are allowed. Push, merge and the
+    rest of rule 1 stay blocked. Agents can't flip it: config.json is write-protected (rule 13)."""
+    from . import common as C
+    return C.config()["guard"].get("allow_commit") is True
+
+
 def _git(argv, envs, raw):
     args = argv[1:]
     sub, i = None, 0
@@ -306,6 +313,8 @@ def _git(argv, envs, raw):
     if "--no-verify" in args or any(e.startswith(("SKIP=", "HUSKY=0", "HUSKY_SKIP")) for e in envs):
         raise Block("3", "skipping git hooks / checks (--no-verify, SKIP=, HUSKY=0)")
     if sub is None:
+        return
+    if sub == "commit" and "--amend" not in rest and _commit_allowed():
         return
     if sub in GIT_WRITE_BLOCK:
         raise Block("1", "`git %s` changes history or the remote; agents never commit, push, merge or rebase" % sub)

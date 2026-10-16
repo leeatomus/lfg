@@ -19,6 +19,8 @@ Agents read git and GitHub; the human writes. Every change is left **unstaged** 
 
 Wrapping doesn't change the verdict: `cd x && git push`, `sh -c`, `bash -lc`, `eval`, `xargs`, aliases, variables and subshells are parsed by `lfg-guard` and blocked the same way.
 
+If `guard.allow_commit` is `true` in `~/.lfg/config.json`, `git commit` (not `--amend`) is allowed and you commit when the user asks. Everything else in rule 1, and rules 2 and 3, still holds.
+
 ## When blocked
 
 The guard exits 2 with: `Blocked by LFG rule <N>: <why>. A human must do this in their own terminal.`
